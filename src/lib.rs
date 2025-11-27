@@ -5,10 +5,11 @@
 //!
 //! Note that registrations are bound by TypeId so if you do impl both traits on a struct, only the last will take
 //! effect if [`PrefabPlugin::panic_on_double_registration`] is false, otherwise the application will panic as the name
-//! indicates
+//! indicates.
 //!
-//! Prefabs
-//!
+//! Use the [`Prefabs`] resource to spawn a prefab of a type. Spawning unfortunately requires world access so it must be
+//! ran on an exclusive system. A pattern to follow would be to setup everything you need in a normal system, and then
+//! use [`Commands::queue`] with [`World::resource_scope`] to pull [`Prefabs`] from the world.
 
 use bevy_app::prelude::*;
 use bevy_asset::{
@@ -19,7 +20,7 @@ use bevy_ecs::{
     system::{SystemParam, SystemState},
 };
 use bevy_log::prelude::*;
-use bevy_platform::{collections::HashMap, hash::NoOpHash};
+use bevy_platform::collections::HashMap;
 use bevy_reflect::{
     PartialReflect, Reflect, ReflectKind, Reflectable, TypeRegistration, TypeRegistry,
 };
@@ -27,7 +28,7 @@ use bevy_utils::TypeIdMap;
 use derive_more::{Deref, DerefMut};
 use ordermap::OrderMap;
 use serde::Deserialize;
-use std::{any::TypeId, marker::PhantomData, path::PathBuf};
+use std::{any::TypeId, borrow::Borrow, marker::PhantomData, path::PathBuf};
 
 /// A SystemParam QOL type to indicate no params are desired
 #[derive(SystemParam)]
@@ -179,7 +180,8 @@ pub trait Prefab: Bundle + Sized {
     type Descriptor: Asset + Clone + Reflectable + for<'de> Deserialize<'de>;
 
     /// A SystemParam that will be passed into [`Prefab::spawn`] whenever it
-    /// is called. Keeps state so locals are also valid for use.
+    /// is called. Stores state so locals are also valid for use. This state is
+    /// unique per type, not per variant.
     type Params<'w, 's>: for<'world, 'system> SystemParam<
         Item<'world, 'system> = Self::Params<'world, 'system>,
     >;
@@ -259,25 +261,75 @@ where
 
 type SpawnFn = Box<dyn FnMut(&mut World) + Send + Sync>;
 
-/// A resource containing all known prefabs
+#[derive(Resource, Deref, DerefMut)]
+struct StateHolder<T>(SystemState<T>)
+where
+    T: SystemParam + 'static;
+
+type PrefabStateHolder<'w, 's, T> = StateHolder<<T as Prefab>::Params<'w, 's>>;
+
+/// A resource containing all known prefabs. Requires the world to spawn due to
+/// usage of states.
 #[derive(Resource, Default)]
 pub struct Prefabs {
-    prefabs: TypeIdMap<HashMap<Option<Name>, SpawnFn, NoOpHash>>,
+    prefabs: TypeIdMap<HashMap<Option<Name>, SpawnFn>>,
 }
 
 impl Prefabs {
-    pub fn spawn<T>(&mut self, world: &mut World) -> bool
+    /// Spawn a prefab with the supplied identifier.
+    pub fn spawn<T: 'static>(&mut self, world: &mut World, key: impl Borrow<Option<Name>>) -> bool {
+        let Some(spawner) = self
+            .prefabs
+            .get_mut(&TypeId::of::<T>())
+            .and_then(|variants| variants.get_mut(key.borrow()))
+        else {
+            return false;
+        };
+
+        (spawner)(world);
+
+        true
+    }
+
+    /// Spawn the nameless prefab for a given type.
+    ///
+    /// Returns true if successful.
+    pub fn spawn_nameless<T>(&mut self, world: &mut World) -> bool
     where
         T: 'static,
     {
-        self.internal_spawn::<T>(world, &None)
+        self.spawn::<T>(world, None)
     }
 
+    /// Spawn the variant of a prefab for a given type.
+    ///
+    /// Returns true if successful.
     pub fn spawn_variant<T>(&mut self, world: &mut World, name: impl Into<Name>) -> bool
     where
         T: 'static,
     {
-        self.internal_spawn::<T>(world, &Some(name.into()))
+        self.spawn::<T>(world, Some(name.into()))
+    }
+
+    /// Return the number of prefabs registered.
+    pub fn len(&self) -> usize {
+        self.prefabs.len()
+    }
+
+    /// Return true if there are no prefabs registered.
+    pub fn is_empty(&self) -> bool {
+        self.prefabs.is_empty()
+    }
+
+    /// Return the number of prefab variants registered for a type. This includes the nameless if present.
+    pub fn len_of_type<T>(&self) -> usize
+    where
+        T: 'static,
+    {
+        self.prefabs
+            .get(&TypeId::of::<T>())
+            .map(|m| m.len())
+            .unwrap_or_default()
     }
 
     pub fn has_type<T>(&self) -> bool
@@ -301,15 +353,20 @@ impl Prefabs {
             .unwrap_or_default()
     }
 
+    pub fn iter_variants<T>(&self) -> impl Iterator<Item = &Option<Name>>
+    where
+        T: 'static,
+    {
+        self.prefabs
+            .get(&TypeId::of::<T>())
+            .map(|variants| variants.keys())
+            .unwrap_or_default()
+    }
+
     pub fn iter_all_types<'t>(
         &self,
         type_registry: &'t TypeRegistry,
-    ) -> impl Iterator<
-        Item = (
-            &'t TypeRegistration,
-            &HashMap<Option<Name>, SpawnFn, NoOpHash>,
-        ),
-    > {
+    ) -> impl Iterator<Item = (&'t TypeRegistration, &HashMap<Option<Name>, SpawnFn>)> {
         self.prefabs
             .iter()
             .filter_map(|(id, variants)| type_registry.get(*id).map(|t| (t, variants)))
@@ -340,27 +397,17 @@ impl Prefabs {
         self.internal_register_static_prefab::<T>(world, Some(name.into()));
     }
 
-    fn internal_spawn<T: 'static>(&mut self, world: &mut World, name: &Option<Name>) -> bool {
-        let Some(spawner) = self
-            .prefabs
-            .get_mut(&TypeId::of::<T>())
-            .and_then(|variants| variants.get_mut(name))
-        else {
-            return false;
-        };
-
-        (spawner)(world);
-
-        true
-    }
-
     fn internal_register_prefab<T: Prefab>(
         &mut self,
         handle: Handle<T::Descriptor>,
         world: &mut World,
         name: Option<Name>,
     ) {
-        let mut state = SystemState::<T::Params<'_, '_>>::new(world);
+        if !world.contains_resource::<PrefabStateHolder<T>>() {
+            let state = SystemState::<T::Params<'_, '_>>::new(world);
+            world.insert_resource(StateHolder(state));
+        }
+
         let entry = self.prefabs.entry(TypeId::of::<T>()).or_default();
         entry.insert(
             name,
@@ -375,11 +422,16 @@ impl Prefabs {
                 };
 
                 let entity = world.spawn_empty().id();
-                let params = state.get_mut(world);
-                let bundle = T::spawn(entity, descriptor, params);
-                if let Ok(mut entity) = world.get_entity_mut(entity) {
-                    entity.insert(bundle);
-                }
+
+                world.resource_scope(|world, mut state: Mut<PrefabStateHolder<T>>| {
+                    let params = state.get_mut(world);
+                    let bundle = T::spawn(entity, descriptor, params);
+                    state.apply(world);
+
+                    if let Ok(mut entity) = world.get_entity_mut(entity) {
+                        entity.insert(bundle);
+                    }
+                });
             }),
         );
     }
@@ -467,11 +519,14 @@ fn handle_descriptor_loads<T>(
     }
 }
 
-fn should_check_folder_loads<T>(should_check: Res<FolderLoadCheck<T>>) -> bool
+fn should_check_folder_loads<T>(
+    folder_handle: Option<Res<PrefabFolderHandle<T>>>,
+    should_check: Res<FolderLoadCheck<T>>,
+) -> bool
 where
     T: Prefab,
 {
-    **should_check
+    folder_handle.is_some() && **should_check
 }
 
 fn handle_folder_loads<T>(
@@ -611,6 +666,8 @@ where
     }
 }
 
+/// A resource holding the handle to the folder the given prefab type was
+/// loaded from. This can be removed after loading if reloads aren't desired
 #[derive(Resource)]
 pub struct PrefabFolderHandle<T>
 where
@@ -665,7 +722,7 @@ where
     }
 }
 
-/// Triggered if the prefab type fails to load all prefabs
+/// Triggered if the prefab type fails to load some prefabs
 #[derive(Event)]
 pub struct PrefabsLoadFailureEvent<T>
 where
@@ -715,18 +772,17 @@ where
 
         let reflected = descriptor.as_reflect();
 
-        'reflect_test: {
-            match reflected.reflect_kind() {
-                ReflectKind::Struct => get_field_key_from_struct(reflected, key),
-                ReflectKind::TupleStruct => {
-                    let Ok(key) = key.parse() else {
-                        break 'reflect_test None;
-                    };
+        match reflected.reflect_kind() {
+            ReflectKind::Struct => get_field_key_from_struct(reflected, key),
+            ReflectKind::TupleStruct => {
+                let Ok(key) = key.parse() else {
+                    error!(key, "Variant key is not valid for tuple struct");
+                    return PrefabRegistrationResult::Fail;
+                };
 
-                    get_field_key_from_tuple_struct(reflected, key)
-                }
-                _ => None,
+                get_field_key_from_tuple_struct(reflected, key)
             }
+            _ => None,
         }
         .and_then(|field: &dyn PartialReflect| {
             field

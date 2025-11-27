@@ -1,9 +1,11 @@
-use std::time::Duration;
+//! This example shows how to create a prefab and also have logic built into the
+//! spawn function to control how they are spawned
 
 use bevy::{prelude::*, time::common_conditions::on_timer};
 use bevy_ecs::system::SystemParam;
-use brefabs::{Prefab, PrefabPlugin};
+use brefabs::{Prefab, PrefabPlugin, Prefabs};
 use serde::Deserialize;
+use std::time::Duration;
 
 fn main() {
     App::new()
@@ -20,7 +22,7 @@ fn main() {
         .add_systems(
             FixedUpdate,
             spawn_cubes
-                .run_if(have_less_than::<10, Mesh3d>)
+                .run_if(have_less_than::<20, Mesh3d>)
                 .run_if(have_prefabs)
                 .run_if(on_timer(Duration::from_secs(1))),
         )
@@ -86,7 +88,7 @@ impl Prefab for ExamplePrefab {
         Self {
             name: Name::new(desc.variant),
             mesh: Mesh3d(params.meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
-            mesh_material: MeshMaterial3d(params.materials.add(Color::srgb_u8(124, 144, 255))),
+            mesh_material: MeshMaterial3d(params.materials.add(desc.color)),
             transform: Transform::from_xyz(offset.x, params.spiral.h, offset.y),
         }
     }
@@ -119,21 +121,20 @@ fn startup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // circular base
     commands.spawn((
         Name::new("Base"),
         Mesh3d(meshes.add(Circle::new(4.0))),
         MeshMaterial3d(materials.add(Color::WHITE)),
         Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
     ));
-    // cube
+
     commands.spawn((
         Name::new("Cube"),
         Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
         MeshMaterial3d(materials.add(Color::srgb_u8(124, 144, 255))),
         Transform::from_xyz(0.0, 0.5, 0.0),
     ));
-    // light
+
     commands.spawn((
         Name::new("Light"),
         PointLight {
@@ -142,11 +143,11 @@ fn startup(
         },
         Transform::from_xyz(4.0, 8.0, 4.0),
     ));
-    // camera
+
     commands.spawn((
         Name::new("Game Camera"),
         Camera3d::default(),
-        Transform::from_xyz(-2.5, 4.5, 9.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(8.0, 4.0, 32.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 }
 
@@ -159,9 +160,18 @@ fn on_folder_failure(_: On<brefabs::PrefabsLoadFailureEvent<ExamplePrefab>>) {
     error!("example failed to load");
 }
 
-fn spawn_cubes(world: &mut World) {
-    world.resource_scope(|world, mut prefabs: Mut<brefabs::Prefabs>| {
-        if !prefabs.spawn_variant::<ExamplePrefab>(world, "red") {
+fn spawn_cubes(world: &mut World, mut index: Local<usize>) {
+    world.resource_scope(|world, mut prefabs: Mut<Prefabs>| {
+        *index = (*index + 1) % prefabs.len_of_type::<ExamplePrefab>();
+        let Some(name) = prefabs
+            .iter_variants::<ExamplePrefab>()
+            .nth(*index)
+            .cloned()
+        else {
+            return;
+        };
+
+        if !prefabs.spawn::<ExamplePrefab>(world, name) {
             error!("failed to spawn variant")
         }
     });
