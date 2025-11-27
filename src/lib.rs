@@ -1,509 +1,769 @@
+//! This crate provides prefab support to Bevy through the usage of a plugin [`PrefabPlugin`] and two traits [`Prefab`]
+//! and [`StaticPrefab`].
+//!
+//! Define either or both traits on a struct and register it with the respective function on the plugin.
+//!
+//! Note that registrations are bound by TypeId so if you do impl both traits on a struct, only the last will take
+//! effect if [`PrefabPlugin::panic_on_double_registration`] is false, otherwise the application will panic as the name
+//! indicates
+//!
+//! Prefabs
+//!
+
 use bevy_app::prelude::*;
-use bevy_asset::{AssetLoader, LoadContext, LoadedFolder, io::Reader, prelude::*};
+use bevy_asset::{
+    AssetLoader, LoadContext, LoadedFolder, RecursiveDependencyLoadState, io::Reader, prelude::*,
+};
 use bevy_ecs::{
-  prelude::*,
-  system::{SystemParam, SystemState},
+    prelude::*,
+    system::{SystemParam, SystemState},
 };
 use bevy_log::prelude::*;
 use bevy_platform::{collections::HashMap, hash::NoOpHash};
-use bevy_reflect::{PartialReflect, Reflect, ReflectKind, Reflectable, TypeRegistry};
+use bevy_reflect::{
+    PartialReflect, Reflect, ReflectKind, Reflectable, TypeRegistration, TypeRegistry,
+};
 use bevy_utils::TypeIdMap;
-use derive_more::Deref;
+use derive_more::{Deref, DerefMut};
+use ordermap::OrderMap;
 use serde::Deserialize;
 use std::{any::TypeId, marker::PhantomData, path::PathBuf};
 
+/// A SystemParam QOL type to indicate no params are desired
 #[derive(SystemParam)]
 pub struct NoParams<'w, 's>(PhantomData<(&'w (), &'s ())>);
 
+type RegistrationFn = Box<dyn Fn(&mut App) + Send + Sync>;
+
+/// The base plugin for prefab support. Use the registration functions to add respective types.
 #[derive(Default)]
 pub struct PrefabPlugin {
-  prefab_registrations: Vec<Box<dyn Fn(&mut App) + Send + Sync>>,
-  static_prefab_registrations: Vec<Box<dyn Fn(&mut World, &mut Prefabs) + Send + Sync>>,
+    registrations: OrderMap<TypeId, RegistrationFn>,
+    panic_on_double_registration: bool,
 }
 
 impl PrefabPlugin {
-  pub fn with_prefab<T>(mut self) -> Self
-  where
-    T: Prefab,
-  {
-    self.add_prefab::<T>();
-    self
-  }
+    /// Register a prefab type using the default slot
+    pub fn with_prefab<T>(mut self) -> Self
+    where
+        T: Prefab,
+    {
+        self.add_prefab::<T>();
+        self
+    }
 
-  pub fn with_static_prefab<T>(mut self) -> Self
-  where
-    T: StaticPrefab,
-  {
-    self.add_static_prefab::<T>();
-    self
-  }
+    /// Register a static prefab type using the default slot
+    pub fn with_static_prefab<T>(mut self) -> Self
+    where
+        T: StaticPrefab,
+    {
+        self.add_static_prefab::<T>();
+        self
+    }
 
-  pub fn with_static_prefab_variant<T>(mut self, name: impl Into<Name>) -> Self
-  where
-    T: StaticPrefab,
-  {
-    self.add_static_prefab_variant::<T>(name);
-    self
-  }
+    /// Register a named static prefab type
+    pub fn with_static_prefab_variant<T>(mut self, name: impl Into<Name>) -> Self
+    where
+        T: StaticPrefab,
+    {
+        self.add_static_prefab_variant::<T>(name);
+        self
+    }
 
-  pub fn add_prefab<T>(&mut self) -> &mut Self
-  where
-    T: Prefab,
-  {
-    self.prefab_registrations.push(Box::new(|app| {
-      app
-        .init_asset::<T::Descriptor>()
-        .register_asset_loader(PrefabLoader::<T>::default())
-        .add_observer(on_prefab_loaded::<T>.pipe(register_prefab::<T>))
-        // on startup create a prefab loader
-        .add_systems(Startup, startup::<T>)
-        // then read all events that come in for the loaded prefab
-        .add_systems(FixedUpdate, on_folder_notify::<T>);
-    }));
-    self
-  }
+    /// Register a prefab type using the default slot
+    pub fn add_prefab<T>(&mut self) -> &mut Self
+    where
+        T: Prefab,
+    {
+        self.check_type_is_new::<T>();
+        self.registrations.insert(
+            TypeId::of::<T>(),
+            Box::new(|app| {
+                app.init_asset::<T::Descriptor>()
+                    .register_asset_loader(PrefabLoader::<T>::default())
+                    .add_observer(on_prefab_loaded::<T>.pipe(register_prefab::<T>))
+                    .add_systems(Startup, startup::<T>)
+                    .add_systems(FixedUpdate, handle_descriptor_loads::<T>);
 
-  pub fn add_static_prefab<T>(&mut self) -> &mut Self
-  where
-    T: StaticPrefab,
-  {
-    self
-      .static_prefab_registrations
-      .push(Box::new(|world, prefabs| {
-        prefabs.register_static_prefab::<T>(world);
-      }));
-    self
-  }
+                if T::VARIANT_FIELD.is_some() {
+                    app.insert_resource(FolderLoadCheck::<T>::new(true))
+                        .add_systems(
+                            FixedUpdate,
+                            handle_folder_loads::<T>.run_if(should_check_folder_loads::<T>),
+                        );
+                }
+            }),
+        );
+        self
+    }
 
-  pub fn add_static_prefab_variant<T>(&mut self, name: impl Into<Name>) -> &mut Self
-  where
-    T: StaticPrefab,
-  {
-    let name = name.into();
-    self
-      .static_prefab_registrations
-      .push(Box::new(move |world, prefabs| {
-        prefabs.register_static_prefab_variant::<T>(world, name.clone());
-      }));
-    self
-  }
+    /// Register a static prefab type using the default slot
+    pub fn add_static_prefab<T>(&mut self) -> &mut Self
+    where
+        T: StaticPrefab,
+    {
+        self.check_type_is_new::<T>();
+        self.registrations.insert(
+            TypeId::of::<T>(),
+            Box::new(|app| {
+                app.world_mut()
+                    .resource_scope(|world, mut prefabs: Mut<Prefabs>| {
+                        prefabs.register_static_prefab::<T>(world);
+                    });
+            }),
+        );
+        self
+    }
+
+    /// Register a named static prefab type
+    pub fn add_static_prefab_variant<T>(&mut self, name: impl Into<Name>) -> &mut Self
+    where
+        T: StaticPrefab,
+    {
+        self.check_type_is_new::<T>();
+        let name = name.into();
+        self.registrations.insert(
+            TypeId::of::<T>(),
+            Box::new(move |app| {
+                app.world_mut()
+                    .resource_scope(|world, mut prefabs: Mut<Prefabs>| {
+                        prefabs.register_static_prefab_variant::<T>(world, name.clone());
+                    });
+            }),
+        );
+        self
+    }
+
+    fn check_type_is_new<T>(&self)
+    where
+        T: 'static,
+    {
+        if self.registrations.contains_key(&TypeId::of::<T>()) {
+            let name = std::any::type_name::<T>();
+            if self.panic_on_double_registration {
+                panic!("Tried to register {name} twice!");
+            } else {
+                warn!(
+                    type_name = std::any::type_name::<T>(),
+                    "Registered a type multiple times!"
+                )
+            }
+        }
+    }
 }
 
 impl Plugin for PrefabPlugin {
-  fn build(&self, app: &mut App) {
-    let mut prefabs = Prefabs::default();
+    fn build(&self, app: &mut App) {
+        app.init_resource::<Prefabs>();
 
-    for f in &self.static_prefab_registrations {
-      (f)(app.world_mut(), &mut prefabs);
+        for f in self.registrations.values() {
+            (f)(app);
+        }
     }
-
-    app.insert_resource::<Prefabs>(prefabs);
-
-    for f in &self.prefab_registrations {
-      (f)(app);
-    }
-  }
 }
 
+/// The trait that marks a type as a valid Prefab
 pub trait Prefab: Bundle + Sized {
-  const EXTENSIONS: &[&str];
+    /// List of extensions to match for. Is used with
+    /// [`AssetLoader::extensions`] for recursively loading an entire directory
+    /// of prefabs.
+    const EXTENSIONS: &[&str];
 
-  /// If this is set the ron descriptor will first be deserialized
-  /// into a value and this name will be used to get the property
-  const VARIANT_KEY: Option<&str> = None;
+    /// If this is set the ron descriptor will first be deserialized into a
+    /// value and this field will be used to get the property that represents
+    /// the variant name.
+    const VARIANT_FIELD: Option<&str> = None;
 
-  type Descriptor: Asset + Clone + Reflectable + for<'de> Deserialize<'de>;
+    /// A type that is deserialized from the source file and can be translated
+    /// into the concrete prefab type.
+    type Descriptor: Asset + Clone + Reflectable + for<'de> Deserialize<'de>;
 
-  type Params<'w, 's>: for<'world, 'system> SystemParam<
-    Item<'world, 'system> = Self::Params<'world, 'system>,
-  >;
+    /// A SystemParam that will be passed into [`Prefab::spawn`] whenever it
+    /// is called. Keeps state so locals are also valid for use.
+    type Params<'w, 's>: for<'world, 'system> SystemParam<
+        Item<'world, 'system> = Self::Params<'world, 'system>,
+    >;
 
-  fn spawn(entity: Entity, desc: Self::Descriptor, params: Self::Params<'_, '_>) -> Self;
+    /// Spawn an instance of this prefab.
+    ///
+    /// * `entity`: An empty entity spawned by the world, can be safely despawned if desired for any reason.
+    fn spawn(entity: Entity, desc: Self::Descriptor, params: Self::Params<'_, '_>) -> Self;
 
-  fn path() -> impl Into<PathBuf>;
+    /// Returns the path to the directory that all prefabs should be loaded from.
+    ///
+    /// This recurses so in reality you could return the root of the assets if
+    /// you wanted to load everything that matches the extensions.
+    fn path() -> impl Into<PathBuf>;
+
+    /// Deserialize the prefab into the descriptor type. By default prefabs use
+    /// Ron, but any means of deserializing will do.
+    fn deserialize(bytes: Vec<u8>) -> Result<Self::Descriptor> {
+        Ok(ron::de::from_bytes(&bytes)?)
+    }
 }
 
+/// Create a static prefab. This differs from [`Prefab`] such that the type
+/// needs no descriptor nor is loaded from files. Instead the spawn logic is
+/// programmatically controlled.
 pub trait StaticPrefab: Bundle + Sized {
-  type Params<'w, 's>: for<'world, 'system> SystemParam<
-    Item<'world, 'system> = Self::Params<'world, 'system>,
-  >;
+    type Params<'w, 's>: for<'world, 'system> SystemParam<
+        Item<'world, 'system> = Self::Params<'world, 'system>,
+    >;
 
-  fn spawn(entity: Entity, params: Self::Params<'_, '_>) -> Self;
+    /// Spawn an instance of this prefab.
+    ///
+    /// * `entity`: An empty entity spawned by the world, can be safely despawned if desired for any reason.
+    /// * `name`: The name of this variant, None if the default.
+    fn spawn(entity: Entity, name: Option<Name>, params: Self::Params<'_, '_>) -> Self;
 }
 
+/// QOL trait if the prefab type is the same as its descriptor.
+///
+/// Forwards configuration to Prefab
 pub trait IdentityPrefab: Asset + for<'de> Deserialize<'de> {
-  const EXTENSIONS: &[&str];
+    const EXTENSIONS: &[&str];
 
-  const VARIANT_KEY: Option<&str> = None;
+    const VARIANT_FIELD: Option<&str>;
 
-  fn path() -> impl Into<PathBuf>;
+    fn path() -> impl Into<PathBuf>;
+
+    fn deserialize(bytes: Vec<u8>) -> Result<Self> {
+        Ok(ron::de::from_bytes(&bytes)?)
+    }
 }
 
 impl<T> Prefab for T
 where
-  Self: IdentityPrefab + Clone + Reflectable + Bundle + Sized,
+    Self: IdentityPrefab + Reflectable + Bundle + Clone + Sized,
 {
-  const EXTENSIONS: &[&str] = <Self as IdentityPrefab>::EXTENSIONS;
+    const EXTENSIONS: &[&str] = <Self as IdentityPrefab>::EXTENSIONS;
 
-  const VARIANT_KEY: Option<&str> = <Self as IdentityPrefab>::VARIANT_KEY;
+    const VARIANT_FIELD: Option<&str> = <Self as IdentityPrefab>::VARIANT_FIELD;
 
-  type Descriptor = Self;
+    type Descriptor = Self;
 
-  type Params<'w, 's> = NoParams<'w, 's>;
+    type Params<'w, 's> = NoParams<'w, 's>;
 
-  fn spawn(_entity: Entity, desc: Self::Descriptor, _params: Self::Params<'_, '_>) -> Self {
-    desc
-  }
+    fn spawn(_entity: Entity, desc: Self::Descriptor, _params: Self::Params<'_, '_>) -> Self {
+        desc
+    }
 
-  fn path() -> impl Into<PathBuf> {
-    <Self as IdentityPrefab>::path()
-  }
+    fn path() -> impl Into<PathBuf> {
+        <Self as IdentityPrefab>::path()
+    }
+
+    fn deserialize(bytes: Vec<u8>) -> Result<Self> {
+        <Self as IdentityPrefab>::deserialize(bytes)
+    }
 }
 
 type SpawnFn = Box<dyn FnMut(&mut World) + Send + Sync>;
 
+/// A resource containing all known prefabs
 #[derive(Resource, Default)]
 pub struct Prefabs {
-  prefabs: TypeIdMap<HashMap<Option<Name>, SpawnFn, NoOpHash>>,
+    prefabs: TypeIdMap<HashMap<Option<Name>, SpawnFn, NoOpHash>>,
 }
 
 impl Prefabs {
-  pub fn spawn<T>(&mut self, world: &mut World) -> bool
-  where
-    T: 'static,
-  {
-    self.internal_spawn::<T>(world, &None)
-  }
+    pub fn spawn<T>(&mut self, world: &mut World) -> bool
+    where
+        T: 'static,
+    {
+        self.internal_spawn::<T>(world, &None)
+    }
 
-  pub fn spawn_variant<T>(&mut self, world: &mut World, name: impl Into<Name>) -> bool
-  where
-    T: 'static,
-  {
-    self.internal_spawn::<T>(world, &Some(name.into()))
-  }
+    pub fn spawn_variant<T>(&mut self, world: &mut World, name: impl Into<Name>) -> bool
+    where
+        T: 'static,
+    {
+        self.internal_spawn::<T>(world, &Some(name.into()))
+    }
 
-  pub fn iter(&self) -> impl Iterator {
-    self.prefabs.iter()
-  }
+    pub fn has_type<T>(&self) -> bool
+    where
+        T: 'static,
+    {
+        self.prefabs.contains_key(&TypeId::of::<T>())
+    }
 
-  pub fn iter_type<T>(&self) -> Option<impl Iterator<Item = (&Option<Name>, &SpawnFn)>>
-  where
-    T: 'static,
-  {
-    self
-      .prefabs
-      .get(&TypeId::of::<T>())
-      .map(|variants| variants.iter())
-  }
+    pub fn iter(&self) -> impl Iterator {
+        self.prefabs.iter()
+    }
 
-  pub fn iter_all_types(&self, type_registry: &TypeRegistry) -> impl Iterator {
-    self
-      .prefabs
-      .iter()
-      .filter_map(|(id, variants)| type_registry.get(*id).and_then(|t| Some((t, variants))))
-  }
+    pub fn iter_type<T>(&self) -> impl Iterator<Item = (&Option<Name>, &SpawnFn)>
+    where
+        T: 'static,
+    {
+        self.prefabs
+            .get(&TypeId::of::<T>())
+            .map(|variants| variants.iter())
+            .unwrap_or_default()
+    }
 
-  pub fn register_prefab<T: Prefab>(&mut self, handle: Handle<T::Descriptor>, world: &mut World) {
-    self.internal_register_prefab::<T>(handle, world, None);
-  }
+    pub fn iter_all_types<'t>(
+        &self,
+        type_registry: &'t TypeRegistry,
+    ) -> impl Iterator<
+        Item = (
+            &'t TypeRegistration,
+            &HashMap<Option<Name>, SpawnFn, NoOpHash>,
+        ),
+    > {
+        self.prefabs
+            .iter()
+            .filter_map(|(id, variants)| type_registry.get(*id).map(|t| (t, variants)))
+    }
 
-  pub fn register_prefab_variant<T: Prefab>(
-    &mut self,
-    handle: Handle<T::Descriptor>,
-    world: &mut World,
-    name: impl Into<Name>,
-  ) {
-    self.internal_register_prefab::<T>(handle, world, Some(name.into()));
-  }
+    pub fn register_prefab<T: Prefab>(&mut self, handle: Handle<T::Descriptor>, world: &mut World) {
+        self.internal_register_prefab::<T>(handle, world, None);
+    }
 
-  pub fn register_static_prefab<T: StaticPrefab>(&mut self, world: &mut World) {
-    self.internal_register_static_prefab::<T>(world, None);
-  }
+    pub fn register_prefab_variant<T: Prefab>(
+        &mut self,
+        handle: Handle<T::Descriptor>,
+        world: &mut World,
+        name: impl Into<Name>,
+    ) {
+        self.internal_register_prefab::<T>(handle, world, Some(name.into()));
+    }
 
-  pub fn register_static_prefab_variant<T: StaticPrefab>(
-    &mut self,
-    world: &mut World,
-    name: impl Into<Name>,
-  ) {
-    self.internal_register_static_prefab::<T>(world, Some(name.into()));
-  }
+    pub fn register_static_prefab<T: StaticPrefab>(&mut self, world: &mut World) {
+        self.internal_register_static_prefab::<T>(world, None);
+    }
 
-  fn internal_spawn<T: 'static>(&mut self, world: &mut World, name: &Option<Name>) -> bool {
-    let Some(spawner) = self
-      .prefabs
-      .get_mut(&TypeId::of::<T>())
-      .and_then(|variants| variants.get_mut(name))
-    else {
-      return false;
-    };
+    pub fn register_static_prefab_variant<T: StaticPrefab>(
+        &mut self,
+        world: &mut World,
+        name: impl Into<Name>,
+    ) {
+        self.internal_register_static_prefab::<T>(world, Some(name.into()));
+    }
 
-    (spawner)(world);
-
-    true
-  }
-
-  fn internal_register_prefab<T: Prefab>(
-    &mut self,
-    handle: Handle<T::Descriptor>,
-    world: &mut World,
-    name: Option<Name>,
-  ) {
-    let mut state = SystemState::<T::Params<'_, '_>>::new(world);
-    let entry = self.prefabs.entry(TypeId::of::<T>()).or_default();
-    entry.insert(
-      name,
-      Box::new(move |world: &mut World| {
-        let descriptors = world.resource::<Assets<T::Descriptor>>();
-        let Some(descriptor) = descriptors.get(handle.id()).cloned() else {
-          error!(
-            "Failed to get descriptor asset for {}",
-            std::any::type_name::<T>()
-          );
-          return;
+    fn internal_spawn<T: 'static>(&mut self, world: &mut World, name: &Option<Name>) -> bool {
+        let Some(spawner) = self
+            .prefabs
+            .get_mut(&TypeId::of::<T>())
+            .and_then(|variants| variants.get_mut(name))
+        else {
+            return false;
         };
 
-        let entity = world.spawn_empty().id();
-        let params = state.get_mut(world);
-        let bundle = T::spawn(entity, descriptor, params);
-        world.entity_mut(entity).insert(bundle);
-      }),
-    );
-  }
+        (spawner)(world);
 
-  fn internal_register_static_prefab<T: StaticPrefab>(
-    &mut self,
-    world: &mut World,
-    name: Option<Name>,
-  ) {
-    let mut state = SystemState::<T::Params<'_, '_>>::new(world);
-    let entry = self.prefabs.entry(TypeId::of::<T>()).or_default();
-    entry.insert(
-      name,
-      Box::new(move |world: &mut World| {
-        let entity = world.spawn_empty().id();
-        let params = state.get_mut(world);
-        let bundle = T::spawn(entity, params);
-        world.entity_mut(entity).insert(bundle);
-      }),
-    );
-  }
+        true
+    }
+
+    fn internal_register_prefab<T: Prefab>(
+        &mut self,
+        handle: Handle<T::Descriptor>,
+        world: &mut World,
+        name: Option<Name>,
+    ) {
+        let mut state = SystemState::<T::Params<'_, '_>>::new(world);
+        let entry = self.prefabs.entry(TypeId::of::<T>()).or_default();
+        entry.insert(
+            name,
+            Box::new(move |world: &mut World| {
+                let descriptors = world.resource::<Assets<T::Descriptor>>();
+                let Some(descriptor) = descriptors.get(handle.id()).cloned() else {
+                    error!(
+                        "Failed to get descriptor asset for {}",
+                        std::any::type_name::<T>()
+                    );
+                    return;
+                };
+
+                let entity = world.spawn_empty().id();
+                let params = state.get_mut(world);
+                let bundle = T::spawn(entity, descriptor, params);
+                if let Ok(mut entity) = world.get_entity_mut(entity) {
+                    entity.insert(bundle);
+                }
+            }),
+        );
+    }
+
+    fn internal_register_static_prefab<T: StaticPrefab>(
+        &mut self,
+        world: &mut World,
+        name: Option<Name>,
+    ) {
+        let mut state = SystemState::<T::Params<'_, '_>>::new(world);
+        let entry = self.prefabs.entry(TypeId::of::<T>()).or_default();
+        entry.insert(
+            name.clone(),
+            Box::new(move |world: &mut World| {
+                let entity = world.spawn_empty().id();
+                let params = state.get_mut(world);
+                let bundle = T::spawn(entity, name.clone(), params);
+                if let Ok(mut entity) = world.get_entity_mut(entity) {
+                    entity.insert(bundle);
+                }
+            }),
+        );
+    }
+}
+
+#[derive(SystemParam, Deref)]
+pub struct PrefabDescriptors<'w, T>
+where
+    T: Prefab,
+{
+    descriptors: Res<'w, Assets<<T as Prefab>::Descriptor>>,
+}
+
+#[derive(Resource, Deref, DerefMut)]
+struct FolderLoadCheck<T>
+where
+    T: Prefab,
+{
+    #[deref]
+    #[deref_mut]
+    state: bool,
+    _pd: PhantomData<T>,
+}
+
+impl<T> FolderLoadCheck<T>
+where
+    T: Prefab,
+{
+    fn new(check: bool) -> Self {
+        Self {
+            state: check,
+            _pd: Default::default(),
+        }
+    }
 }
 
 fn startup<T>(mut commands: Commands, assets: ResMut<AssetServer>)
 where
-  T: Prefab,
+    T: Prefab,
 {
-  let handle = assets.load_folder(T::path().into());
-  commands.insert_resource(PrefabFolderHandle::<T>::new(handle));
+    if T::VARIANT_FIELD.is_some() {
+        let handle = assets.load_folder(T::path().into());
+        commands.insert_resource(PrefabFolderHandle::<T>::new(handle));
+    } else {
+        let handle = assets.load(T::path().into());
+        commands.insert_resource(SinglePrefabHandle::<T>(handle));
+    }
 }
 
-fn on_folder_notify<T>(
-  mut commands: Commands,
-  mut event_reader: MessageReader<AssetEvent<LoadedFolder>>,
-  loaded_folders: Res<Assets<LoadedFolder>>,
-  folder: Res<PrefabFolderHandle<T>>,
+fn handle_descriptor_loads<T>(
+    mut commands: Commands,
+    mut messages: MessageReader<AssetEvent<T::Descriptor>>,
+    mut assets: ResMut<Assets<T::Descriptor>>,
 ) where
-  T: Prefab,
+    T: Prefab,
 {
-  let handles = event_reader
-    .read()
-    .filter_map(|event| {
-      if event.is_loaded_with_dependencies(folder.handle()) {
-        loaded_folders.get(folder.handle())
-      } else {
-        None
-      }
-    })
-    .map(|folder| folder.handles.iter().cloned())
-    .flatten();
+    for msg in messages.read() {
+        if let AssetEvent::LoadedWithDependencies { id } = msg {
+            let Some(handle) = assets.get_strong_handle(*id) else {
+                unreachable!();
+            };
 
-  for handle in handles {
-    let typed_handle = handle.typed_debug_checked::<T::Descriptor>();
-    commands.trigger(PrefabLoadedEvent::<T>(typed_handle));
-  }
+            commands.trigger(PrefabLoadedEvent::<T>(handle));
+        }
+    }
+}
+
+fn should_check_folder_loads<T>(should_check: Res<FolderLoadCheck<T>>) -> bool
+where
+    T: Prefab,
+{
+    **should_check
+}
+
+fn handle_folder_loads<T>(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    folder: Res<PrefabFolderHandle<T>>,
+    mut should_check: ResMut<FolderLoadCheck<T>>,
+) where
+    T: Prefab,
+{
+    let Some(state) = assets.get_recursive_dependency_load_state(&folder.handle) else {
+        return;
+    };
+
+    match state {
+        RecursiveDependencyLoadState::Loaded => {
+            **should_check = false;
+            commands.trigger(PrefabsLoadedEvent::<T>::new(folder.handle.clone()));
+        }
+        RecursiveDependencyLoadState::Failed(asset_load_error) => {
+            error!(
+                type_name = std::any::type_name::<T>(),
+                err = asset_load_error.to_string(),
+                "Failed to load prefab"
+            );
+            **should_check = false;
+            commands.trigger(PrefabsLoadFailureEvent::<T>::new(folder.handle.clone()));
+        }
+        _ => {
+            // do nothing
+        }
+    }
 }
 
 fn on_prefab_loaded<T>(event: On<PrefabLoadedEvent<T>>) -> Handle<T::Descriptor>
 where
-  T: Prefab,
+    T: Prefab,
 {
-  event.0.clone()
+    event.0.clone()
 }
 
 fn register_prefab<T>(handle: In<Handle<T::Descriptor>>, mut commands: Commands)
 where
-  T: Prefab,
+    T: Prefab,
 {
-  enum PrefabRegistrationResult {
-    FoundKey(Option<String>),
-    Fail,
-  }
+    let handle = handle.clone();
+    commands.queue(move |world: &mut World| {
+        world.resource_scope(|world, mut prefabs: Mut<Prefabs>| {
+            let found_key: Option<PrefabRegistrationResult> =
+                T::VARIANT_FIELD.map(|key| get_variant_name::<T>(world, &handle, key));
 
-  let handle = handle.clone();
-  commands.queue(move |world: &mut World| {
-    world.resource_scope(|world, mut prefabs: Mut<Prefabs>| {
-      let found_key: Option<PrefabRegistrationResult> = T::VARIANT_KEY.map(|key| {
-        world.resource_scope(|_, descriptors: Mut<Assets<T::Descriptor>>| {
-          let Some(descriptor) = descriptors.get(handle.id()) else {
-            warn!(
-              "Failed to get prefab descriptor for {}",
-              std::any::type_name::<T>()
-            );
-            return PrefabRegistrationResult::Fail;
-          };
-
-          let reflected = descriptor.as_reflect();
-
-          'reflect_test: {
-            match reflected.reflect_kind() {
-              ReflectKind::Struct => get_field_key_from_struct(reflected, key),
-              ReflectKind::TupleStruct => {
-                let Ok(key) = key.parse() else {
-                  break 'reflect_test None;
-                };
-
-                get_field_key_from_tuple_struct(reflected, key)
-              }
-              _ => None,
+            match found_key {
+                Some(result) => match result {
+                    PrefabRegistrationResult::FoundKey(found_key) => match found_key {
+                        Some(variant) => {
+                            prefabs.register_prefab_variant::<T>(
+                                handle.clone(),
+                                world,
+                                Name::from(variant),
+                            );
+                        }
+                        None => {
+                            prefabs.register_prefab::<T>(handle.clone(), world);
+                        }
+                    },
+                    PrefabRegistrationResult::Fail => {
+                        warn!(
+                            type_name = std::any::type_name::<T>(),
+                            "Failed to register prefab variant",
+                        );
+                    }
+                },
+                None => {
+                    prefabs.register_prefab::<T>(handle.clone(), world);
+                }
             }
-          }
-          .and_then(|field: &dyn PartialReflect| {
-            field
-              .try_downcast_ref::<String>()
-              .cloned()
-              .map(Some)
-              .or_else(|| {
-                field
-                  .try_downcast_ref::<Option<String>>()
-                  .map(|opt| opt.as_ref().cloned())
-              })
-          })
-          .map(PrefabRegistrationResult::FoundKey)
-          .unwrap_or(PrefabRegistrationResult::Fail)
-        })
-      });
-
-      match found_key {
-        Some(result) => match result {
-          PrefabRegistrationResult::FoundKey(found_key) => match found_key {
-            Some(variant) => {
-              prefabs.register_prefab_variant::<T>(handle.clone(), world, Name::from(variant));
-            }
-            None => {
-              prefabs.register_prefab::<T>(handle.clone(), world);
-            }
-          },
-          PrefabRegistrationResult::Fail => {
-            warn!(
-              "Failed to register prefab variant {}",
-              std::any::type_name::<T>()
-            );
-          }
-        },
-        None => {
-          prefabs.register_prefab::<T>(handle.clone(), world);
-        }
-      }
+        });
     });
-  });
-}
-
-fn get_field_key_from_struct<'a>(
-  reflected: &'a dyn Reflect,
-  key: &str,
-) -> Option<&'a dyn PartialReflect> {
-  let reflected = reflected
-    .reflect_ref()
-    .as_struct()
-    .expect("Should be a struct");
-
-  Some(reflected.field(key)).flatten()
-}
-
-fn get_field_key_from_tuple_struct<'a>(
-  reflected: &'a dyn Reflect,
-  key: usize,
-) -> Option<&'a dyn PartialReflect> {
-  let reflected = reflected
-    .reflect_ref()
-    .as_tuple_struct()
-    .expect("Should be a tuple struct");
-
-  Some(reflected.field(key)).flatten()
 }
 
 struct PrefabLoader<T>
 where
-  T: Prefab,
+    T: Prefab,
 {
-  _phantom_data: PhantomData<T>,
+    _phantom_data: PhantomData<T>,
 }
 
 impl<T> Default for PrefabLoader<T>
 where
-  T: Prefab,
+    T: Prefab,
 {
-  fn default() -> Self {
-    Self {
-      _phantom_data: Default::default(),
+    fn default() -> Self {
+        Self {
+            _phantom_data: Default::default(),
+        }
     }
-  }
 }
 
 impl<T> AssetLoader for PrefabLoader<T>
 where
-  T: Prefab,
+    T: Prefab,
 {
-  type Asset = <T as Prefab>::Descriptor;
+    type Asset = <T as Prefab>::Descriptor;
 
-  type Settings = ();
+    type Settings = ();
 
-  type Error = BevyError;
+    type Error = BevyError;
 
-  async fn load(
-    &self,
-    reader: &mut dyn Reader,
-    _settings: &Self::Settings,
-    _load_context: &mut LoadContext<'_>,
-  ) -> Result<Self::Asset, Self::Error> {
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).await?;
-    let ron: <T as Prefab>::Descriptor = ron::de::from_bytes(&bytes)?;
-    Ok(ron)
-  }
+    async fn load(
+        &self,
+        reader: &mut dyn Reader,
+        _settings: &Self::Settings,
+        _load_context: &mut LoadContext<'_>,
+    ) -> Result<Self::Asset, Self::Error> {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await?;
+        let descriptor: <T as Prefab>::Descriptor = T::deserialize(bytes)?;
+        Ok(descriptor)
+    }
 
-  fn extensions(&self) -> &[&str] {
-    T::EXTENSIONS
-  }
+    fn extensions(&self) -> &[&str] {
+        T::EXTENSIONS
+    }
+}
+
+#[derive(Resource)]
+pub struct SinglePrefabHandle<T>(Handle<T::Descriptor>)
+where
+    T: Prefab;
+
+impl<T> SinglePrefabHandle<T>
+where
+    T: Prefab,
+{
+    pub fn handle(&self) -> &Handle<T::Descriptor> {
+        &self.0
+    }
 }
 
 #[derive(Resource)]
 pub struct PrefabFolderHandle<T>
 where
-  T: Prefab,
+    T: Prefab,
 {
-  handle: Handle<LoadedFolder>,
-  _phantom_data: PhantomData<T>,
+    handle: Handle<LoadedFolder>,
+    _phantom_data: PhantomData<T>,
 }
 
 impl<T> PrefabFolderHandle<T>
 where
-  T: Prefab,
+    T: Prefab,
 {
-  pub fn new(handle: Handle<LoadedFolder>) -> Self {
-    Self {
-      handle,
-      _phantom_data: Default::default(),
+    pub fn new(handle: Handle<LoadedFolder>) -> Self {
+        Self {
+            handle,
+            _phantom_data: Default::default(),
+        }
     }
-  }
-
-  pub fn handle(&self) -> &Handle<LoadedFolder> {
-    &self.handle
-  }
 }
 
+/// Triggered for every prefab of a given type that is loaded
 #[derive(Event, Deref)]
 
 pub struct PrefabLoadedEvent<T>(Handle<T::Descriptor>)
 where
-  T: Prefab;
+    T: Prefab;
+
+/// Triggered when all the prefabs of the given type are loaded
+#[derive(Event)]
+pub struct PrefabsLoadedEvent<T>
+where
+    T: Prefab,
+{
+    handle: Handle<LoadedFolder>,
+    _pd: PhantomData<T>,
+}
+
+impl<T> PrefabsLoadedEvent<T>
+where
+    T: Prefab,
+{
+    fn new(handle: Handle<LoadedFolder>) -> Self {
+        Self {
+            handle,
+            _pd: Default::default(),
+        }
+    }
+
+    pub fn handle(&self) -> &Handle<LoadedFolder> {
+        &self.handle
+    }
+}
+
+/// Triggered if the prefab type fails to load all prefabs
+#[derive(Event)]
+pub struct PrefabsLoadFailureEvent<T>
+where
+    T: Prefab,
+{
+    handle: Handle<LoadedFolder>,
+    _pd: PhantomData<T>,
+}
+
+impl<T> PrefabsLoadFailureEvent<T>
+where
+    T: Prefab,
+{
+    fn new(handle: Handle<LoadedFolder>) -> Self {
+        Self {
+            handle,
+            _pd: Default::default(),
+        }
+    }
+
+    pub fn handle(&self) -> &Handle<LoadedFolder> {
+        &self.handle
+    }
+}
+
+enum PrefabRegistrationResult {
+    FoundKey(Option<String>),
+    Fail,
+}
+
+fn get_variant_name<T>(
+    world: &mut World,
+    handle: &Handle<T::Descriptor>,
+    key: &str,
+) -> PrefabRegistrationResult
+where
+    T: Prefab,
+{
+    world.resource_scope(|_, descriptors: Mut<Assets<T::Descriptor>>| {
+        let Some(descriptor) = descriptors.get(handle) else {
+            warn!(
+                type_name = std::any::type_name::<T>(),
+                "Failed to get prefab descriptor",
+            );
+            return PrefabRegistrationResult::Fail;
+        };
+
+        let reflected = descriptor.as_reflect();
+
+        'reflect_test: {
+            match reflected.reflect_kind() {
+                ReflectKind::Struct => get_field_key_from_struct(reflected, key),
+                ReflectKind::TupleStruct => {
+                    let Ok(key) = key.parse() else {
+                        break 'reflect_test None;
+                    };
+
+                    get_field_key_from_tuple_struct(reflected, key)
+                }
+                _ => None,
+            }
+        }
+        .and_then(|field: &dyn PartialReflect| {
+            field
+                .try_downcast_ref::<String>()
+                .cloned()
+                .map(Some)
+                .or_else(|| {
+                    field
+                        .try_downcast_ref::<Option<String>>()
+                        .map(|opt| opt.as_ref().cloned())
+                })
+        })
+        .map(PrefabRegistrationResult::FoundKey)
+        .unwrap_or(PrefabRegistrationResult::Fail)
+    })
+}
+
+fn get_field_key_from_struct<'a>(
+    reflected: &'a dyn Reflect,
+    key: &str,
+) -> Option<&'a dyn PartialReflect> {
+    let reflected = reflected
+        .reflect_ref()
+        .as_struct()
+        .expect("Should be a struct");
+
+    Some(reflected.field(key)).flatten()
+}
+
+fn get_field_key_from_tuple_struct(
+    reflected: &dyn Reflect,
+    key: usize,
+) -> Option<&dyn PartialReflect> {
+    let reflected = reflected
+        .reflect_ref()
+        .as_tuple_struct()
+        .expect("Should be a tuple struct");
+
+    Some(reflected.field(key)).flatten()
+}
