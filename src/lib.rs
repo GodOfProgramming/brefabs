@@ -6,7 +6,7 @@ use bevy_ecs::{
 };
 use bevy_log::prelude::*;
 use bevy_platform::{collections::HashMap, hash::NoOpHash};
-use bevy_reflect::{Reflect, ReflectKind, Reflectable, TypeRegistry};
+use bevy_reflect::{PartialReflect, Reflect, ReflectKind, Reflectable, TypeRegistry};
 use bevy_utils::TypeIdMap;
 use derive_more::Deref;
 use serde::Deserialize;
@@ -358,17 +358,13 @@ where
             _ => None,
           }
         }
-        .and_then(|field| {
-          let value = field.try_downcast_ref::<String>();
-
-          if value.is_none() {
-            warn!(
-              "Could not extract variant from field for {}",
-              std::any::type_name::<T>()
-            );
-          };
-
-          value.cloned()
+        .and_then(|field: &dyn PartialReflect| {
+          field.try_downcast_ref::<String>().cloned().or_else(|| {
+            field
+              .try_downcast_ref::<Option<String>>()
+              .cloned()
+              .flatten()
+          })
         })
       });
 
