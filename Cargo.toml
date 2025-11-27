@@ -2,7 +2,11 @@
 name = "brefabs"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.91.0"
+description = "Bevy Prefabs"
+license-file = "LICENSE"
+documentation = "https://docs.rs/brefabs/latest/brefabs/"
+repository = "https://github.com/GodOfProgramming/brefabs"
+publish = true
 
 [dependencies]
 bevy_app = "0.17.3"
