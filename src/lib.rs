@@ -112,7 +112,7 @@ pub trait Prefab: Bundle + Sized {
   /// into a value and this name will be used to get the property
   const VARIANT_KEY: Option<&str> = None;
 
-  type Descriptor: Asset + Reflectable + Clone + for<'de> Deserialize<'de>;
+  type Descriptor: Asset + Clone + Reflectable + for<'de> Deserialize<'de>;
 
   type Params<'w, 's>: for<'world, 'system> SystemParam<
     Item<'world, 'system> = Self::Params<'world, 'system>,
@@ -131,17 +131,21 @@ pub trait StaticPrefab: Bundle + Sized {
   fn spawn(entity: Entity, params: Self::Params<'_, '_>) -> Self;
 }
 
-pub trait IdentityPrefab: Asset + Clone + for<'de> Deserialize<'de> {
+pub trait IdentityPrefab: Asset + for<'de> Deserialize<'de> {
   const EXTENSIONS: &[&str];
+
+  const VARIANT_KEY: Option<&str> = None;
 
   fn path() -> impl Into<PathBuf>;
 }
 
 impl<T> Prefab for T
 where
-  T: IdentityPrefab + Reflectable + Bundle + Sized,
+  Self: IdentityPrefab + Clone + Reflectable + Bundle + Sized,
 {
   const EXTENSIONS: &[&str] = <Self as IdentityPrefab>::EXTENSIONS;
+
+  const VARIANT_KEY: Option<&str> = <Self as IdentityPrefab>::VARIANT_KEY;
 
   type Descriptor = Self;
 
@@ -182,7 +186,17 @@ impl Prefabs {
     self.prefabs.iter()
   }
 
-  pub fn iter_types(&self, type_registry: &TypeRegistry) -> impl Iterator {
+  pub fn iter_type<T>(&self) -> Option<impl Iterator<Item = (&Option<Name>, &SpawnFn)>>
+  where
+    T: 'static,
+  {
+    self
+      .prefabs
+      .get(&TypeId::of::<T>())
+      .map(|variants| variants.iter())
+  }
+
+  pub fn iter_all_types(&self, type_registry: &TypeRegistry) -> impl Iterator {
     self
       .prefabs
       .iter()
@@ -316,69 +330,109 @@ where
   event.0.clone()
 }
 
-fn register_prefab<T>(handle: In<Handle<T::Descriptor>>, world: &mut World)
+fn register_prefab<T>(handle: In<Handle<T::Descriptor>>, mut commands: Commands)
 where
   T: Prefab,
 {
-  world.resource_scope(|world, mut prefabs: Mut<Prefabs>| match T::VARIANT_KEY {
-    Some(key) => {
-      let variant = world.resource_scope(|_world, descriptors: Mut<Assets<T::Descriptor>>| {
-        let Some(descriptor) = descriptors.get(handle.id()).cloned() else {
-          warn!(
-            "Failed to get prefab descriptor for {}",
-            std::any::type_name::<T>()
-          );
-          return None;
-        };
+  enum PrefabRegistrationResult {
+    FoundKey(Option<String>),
+    Fail,
+  }
 
-        let reflected = descriptor.as_reflect();
+  let handle = handle.clone();
+  commands.queue(move |world: &mut World| {
+    world.resource_scope(|world, mut prefabs: Mut<Prefabs>| {
+      let found_key: Option<PrefabRegistrationResult> = T::VARIANT_KEY.map(|key| {
+        world.resource_scope(|_, descriptors: Mut<Assets<T::Descriptor>>| {
+          let Some(descriptor) = descriptors.get(handle.id()) else {
+            warn!(
+              "Failed to get prefab descriptor for {}",
+              std::any::type_name::<T>()
+            );
+            return PrefabRegistrationResult::Fail;
+          };
 
-        'reflect_test: {
-          match reflected.reflect_kind() {
-            ReflectKind::Struct => {
-              let reflected = reflected
-                .reflect_ref()
-                .as_struct()
-                .expect("Should be a struct");
+          let reflected = descriptor.as_reflect();
 
-              Some(reflected.field(key)).flatten()
+          'reflect_test: {
+            match reflected.reflect_kind() {
+              ReflectKind::Struct => get_field_key_from_struct(reflected, key),
+              ReflectKind::TupleStruct => {
+                let Ok(key) = key.parse() else {
+                  break 'reflect_test None;
+                };
+
+                get_field_key_from_tuple_struct(reflected, key)
+              }
+              _ => None,
             }
-            ReflectKind::TupleStruct => {
-              let Ok(key) = key.parse() else {
-                break 'reflect_test None;
-              };
-
-              let reflected = reflected
-                .reflect_ref()
-                .as_tuple_struct()
-                .expect("Should be a tuple struct");
-
-              Some(reflected.field(key)).flatten()
-            }
-            _ => None,
           }
-        }
-        .and_then(|field: &dyn PartialReflect| {
-          field.try_downcast_ref::<String>().cloned().or_else(|| {
+          .and_then(|field: &dyn PartialReflect| {
             field
-              .try_downcast_ref::<Option<String>>()
+              .try_downcast_ref::<String>()
               .cloned()
-              .flatten()
+              .map(Some)
+              .or_else(|| {
+                field
+                  .try_downcast_ref::<Option<String>>()
+                  .map(|opt| opt.as_ref().cloned())
+              })
           })
+          .map(PrefabRegistrationResult::FoundKey)
+          .unwrap_or(PrefabRegistrationResult::Fail)
         })
       });
 
-      if let Some(variant) = variant {
-        prefabs.register_prefab_variant::<T>(handle.clone(), world, variant);
+      match found_key {
+        Some(result) => match result {
+          PrefabRegistrationResult::FoundKey(found_key) => match found_key {
+            Some(variant) => {
+              prefabs.register_prefab_variant::<T>(handle.clone(), world, Name::from(variant));
+            }
+            None => {
+              prefabs.register_prefab::<T>(handle.clone(), world);
+            }
+          },
+          PrefabRegistrationResult::Fail => {
+            warn!(
+              "Failed to register prefab variant {}",
+              std::any::type_name::<T>()
+            );
+          }
+        },
+        None => {
+          prefabs.register_prefab::<T>(handle.clone(), world);
+        }
       }
-    }
-    None => {
-      prefabs.register_prefab::<T>(handle.clone(), world);
-    }
+    });
   });
 }
 
-pub struct PrefabLoader<T>
+fn get_field_key_from_struct<'a>(
+  reflected: &'a dyn Reflect,
+  key: &str,
+) -> Option<&'a dyn PartialReflect> {
+  let reflected = reflected
+    .reflect_ref()
+    .as_struct()
+    .expect("Should be a struct");
+
+  Some(reflected.field(key)).flatten()
+}
+
+fn get_field_key_from_tuple_struct<'a>(
+  reflected: &'a dyn Reflect,
+  key: usize,
+) -> Option<&'a dyn PartialReflect> {
+  let reflected = reflected
+    .reflect_ref()
+    .as_tuple_struct()
+    .expect("Should be a tuple struct");
+
+  Some(reflected.field(key)).flatten()
+}
+
+struct PrefabLoader<T>
 where
   T: Prefab,
 {
