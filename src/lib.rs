@@ -11,19 +11,24 @@
 //! ran on an exclusive system. A pattern to follow would be to setup everything you need in a normal system, and then
 //! use [`Commands::queue`] with [`World::resource_scope`] to pull [`Prefabs`] from the world.
 
-use bevy_app::prelude::*;
-use bevy_asset::{
-    AssetLoader, LoadContext, LoadedFolder, RecursiveDependencyLoadState, io::Reader, prelude::*,
+mod private;
+
+use crate::private::{
+    FolderLoadCheck, PrefabLoader,
+    systems::{
+        handle_descriptor_loads, handle_folder_loads, on_prefab_loaded, register_prefab,
+        should_check_folder_loads, startup,
+    },
 };
+use bevy_app::prelude::*;
+use bevy_asset::{LoadedFolder, prelude::*};
 use bevy_ecs::{
     prelude::*,
     system::{SystemParam, SystemState},
 };
 use bevy_log::prelude::*;
 use bevy_platform::collections::HashMap;
-use bevy_reflect::{
-    PartialReflect, Reflect, ReflectKind, Reflectable, TypeRegistration, TypeRegistry,
-};
+use bevy_reflect::{Reflectable, TypeRegistration, TypeRegistry};
 use bevy_utils::TypeIdMap;
 use derive_more::{Deref, DerefMut};
 use ordermap::OrderMap;
@@ -465,193 +470,6 @@ where
     descriptors: Res<'w, Assets<<T as Prefab>::Descriptor>>,
 }
 
-#[derive(Resource, Deref, DerefMut)]
-struct FolderLoadCheck<T>
-where
-    T: Prefab,
-{
-    #[deref]
-    #[deref_mut]
-    state: bool,
-    _pd: PhantomData<T>,
-}
-
-impl<T> FolderLoadCheck<T>
-where
-    T: Prefab,
-{
-    fn new(check: bool) -> Self {
-        Self {
-            state: check,
-            _pd: Default::default(),
-        }
-    }
-}
-
-fn startup<T>(mut commands: Commands, assets: ResMut<AssetServer>)
-where
-    T: Prefab,
-{
-    if T::VARIANT_FIELD.is_some() {
-        let handle = assets.load_folder(T::path().into());
-        commands.insert_resource(PrefabFolderHandle::<T>::new(handle));
-    } else {
-        let handle = assets.load(T::path().into());
-        commands.insert_resource(SinglePrefabHandle::<T>(handle));
-    }
-}
-
-fn handle_descriptor_loads<T>(
-    mut commands: Commands,
-    mut messages: MessageReader<AssetEvent<T::Descriptor>>,
-    mut assets: ResMut<Assets<T::Descriptor>>,
-) where
-    T: Prefab,
-{
-    for msg in messages.read() {
-        if let AssetEvent::LoadedWithDependencies { id } = msg {
-            let Some(handle) = assets.get_strong_handle(*id) else {
-                unreachable!();
-            };
-
-            commands.trigger(PrefabLoadedEvent::<T>(handle));
-        }
-    }
-}
-
-fn should_check_folder_loads<T>(
-    folder_handle: Option<Res<PrefabFolderHandle<T>>>,
-    should_check: Res<FolderLoadCheck<T>>,
-) -> bool
-where
-    T: Prefab,
-{
-    folder_handle.is_some() && **should_check
-}
-
-fn handle_folder_loads<T>(
-    mut commands: Commands,
-    assets: Res<AssetServer>,
-    folder: Res<PrefabFolderHandle<T>>,
-    mut should_check: ResMut<FolderLoadCheck<T>>,
-) where
-    T: Prefab,
-{
-    let Some(state) = assets.get_recursive_dependency_load_state(&folder.handle) else {
-        return;
-    };
-
-    match state {
-        RecursiveDependencyLoadState::Loaded => {
-            **should_check = false;
-            commands.trigger(PrefabsLoadedEvent::<T>::new(folder.handle.clone()));
-        }
-        RecursiveDependencyLoadState::Failed(asset_load_error) => {
-            error!(
-                type_name = std::any::type_name::<T>(),
-                err = asset_load_error.to_string(),
-                "Failed to load prefab"
-            );
-            **should_check = false;
-            commands.trigger(PrefabsLoadFailureEvent::<T>::new(folder.handle.clone()));
-        }
-        _ => {
-            // do nothing
-        }
-    }
-}
-
-fn on_prefab_loaded<T>(event: On<PrefabLoadedEvent<T>>) -> Handle<T::Descriptor>
-where
-    T: Prefab,
-{
-    event.0.clone()
-}
-
-fn register_prefab<T>(handle: In<Handle<T::Descriptor>>, mut commands: Commands)
-where
-    T: Prefab,
-{
-    let handle = handle.clone();
-    commands.queue(move |world: &mut World| {
-        world.resource_scope(|world, mut prefabs: Mut<Prefabs>| {
-            let found_key: Option<PrefabRegistrationResult> =
-                T::VARIANT_FIELD.map(|key| get_variant_name::<T>(world, &handle, key));
-
-            match found_key {
-                Some(result) => match result {
-                    PrefabRegistrationResult::FoundKey(found_key) => match found_key {
-                        Some(variant) => {
-                            prefabs.register_prefab_variant::<T>(
-                                handle.clone(),
-                                world,
-                                Name::from(variant),
-                            );
-                        }
-                        None => {
-                            prefabs.register_prefab::<T>(handle.clone(), world);
-                        }
-                    },
-                    PrefabRegistrationResult::Fail => {
-                        warn!(
-                            type_name = std::any::type_name::<T>(),
-                            "Failed to register prefab variant",
-                        );
-                    }
-                },
-                None => {
-                    prefabs.register_prefab::<T>(handle.clone(), world);
-                }
-            }
-        });
-    });
-}
-
-struct PrefabLoader<T>
-where
-    T: Prefab,
-{
-    _phantom_data: PhantomData<T>,
-}
-
-impl<T> Default for PrefabLoader<T>
-where
-    T: Prefab,
-{
-    fn default() -> Self {
-        Self {
-            _phantom_data: Default::default(),
-        }
-    }
-}
-
-impl<T> AssetLoader for PrefabLoader<T>
-where
-    T: Prefab,
-{
-    type Asset = <T as Prefab>::Descriptor;
-
-    type Settings = ();
-
-    type Error = BevyError;
-
-    async fn load(
-        &self,
-        reader: &mut dyn Reader,
-        _settings: &Self::Settings,
-        _load_context: &mut LoadContext<'_>,
-    ) -> Result<Self::Asset, Self::Error> {
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).await?;
-        let descriptor: <T as Prefab>::Descriptor = T::deserialize(bytes)?;
-        Ok(descriptor)
-    }
-
-    fn extensions(&self) -> &[&str] {
-        T::EXTENSIONS
-    }
-}
-
 #[derive(Resource)]
 pub struct SinglePrefabHandle<T>(Handle<T::Descriptor>)
 where
@@ -746,80 +564,4 @@ where
     pub fn handle(&self) -> &Handle<LoadedFolder> {
         &self.handle
     }
-}
-
-enum PrefabRegistrationResult {
-    FoundKey(Option<String>),
-    Fail,
-}
-
-fn get_variant_name<T>(
-    world: &mut World,
-    handle: &Handle<T::Descriptor>,
-    key: &str,
-) -> PrefabRegistrationResult
-where
-    T: Prefab,
-{
-    world.resource_scope(|_, descriptors: Mut<Assets<T::Descriptor>>| {
-        let Some(descriptor) = descriptors.get(handle) else {
-            warn!(
-                type_name = std::any::type_name::<T>(),
-                "Failed to get prefab descriptor",
-            );
-            return PrefabRegistrationResult::Fail;
-        };
-
-        let reflected = descriptor.as_reflect();
-
-        match reflected.reflect_kind() {
-            ReflectKind::Struct => get_field_key_from_struct(reflected, key),
-            ReflectKind::TupleStruct => {
-                let Ok(key) = key.parse() else {
-                    error!(key, "Variant key is not valid for tuple struct");
-                    return PrefabRegistrationResult::Fail;
-                };
-
-                get_field_key_from_tuple_struct(reflected, key)
-            }
-            _ => None,
-        }
-        .and_then(|field: &dyn PartialReflect| {
-            field
-                .try_downcast_ref::<String>()
-                .cloned()
-                .map(Some)
-                .or_else(|| {
-                    field
-                        .try_downcast_ref::<Option<String>>()
-                        .map(|opt| opt.as_ref().cloned())
-                })
-        })
-        .map(PrefabRegistrationResult::FoundKey)
-        .unwrap_or(PrefabRegistrationResult::Fail)
-    })
-}
-
-fn get_field_key_from_struct<'a>(
-    reflected: &'a dyn Reflect,
-    key: &str,
-) -> Option<&'a dyn PartialReflect> {
-    let reflected = reflected
-        .reflect_ref()
-        .as_struct()
-        .expect("Should be a struct");
-
-    Some(reflected.field(key)).flatten()
-}
-
-fn get_field_key_from_tuple_struct(
-    reflected: &dyn Reflect,
-    key: usize,
-) -> Option<&dyn PartialReflect> {
-    let reflected = reflected
-        .reflect_ref()
-        .as_tuple_struct()
-        .expect("Should be a tuple struct");
-
-    Some(reflected.field(key)).flatten()
 }
