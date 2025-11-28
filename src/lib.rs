@@ -321,7 +321,7 @@ where
     }
 }
 
-type SpawnFn = Box<dyn (Fn(&mut World) -> Option<Entity>) + Send + Sync>;
+type SpawnFn = Box<dyn (Fn(&mut World) -> Option<Entity>) + Send + Sync + 'static>;
 
 #[derive(Resource, Deref, DerefMut)]
 struct StateHolder<T>(SystemState<T>)
@@ -331,11 +331,45 @@ where
 type PrefabStateHolder<'w, 's, T> = StateHolder<<T as Prefab>::Params<'w, 's>>;
 type StaticPrefabStateHolder<'w, 's, T> = StateHolder<<T as StaticPrefab>::Params<'w, 's>>;
 
+pub struct PrefabMeta {
+    handle: Option<UntypedHandle>,
+    spawn_fn: SpawnFn,
+}
+
+impl PrefabMeta {
+    fn new(
+        handle: UntypedHandle,
+        spawn_fn: impl (Fn(&mut World) -> Option<Entity>) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            handle: Some(handle),
+            spawn_fn: Box::new(spawn_fn),
+        }
+    }
+
+    fn new_static(
+        spawn_fn: impl (Fn(&mut World) -> Option<Entity>) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            handle: None,
+            spawn_fn: Box::new(spawn_fn),
+        }
+    }
+
+    pub fn handle(&self) -> Option<&UntypedHandle> {
+        self.handle.as_ref()
+    }
+
+    fn spawn(&self, world: &mut World) -> Option<Entity> {
+        (self.spawn_fn)(world)
+    }
+}
+
 /// A resource containing all known prefabs. Requires the world to spawn due to
 /// usage of states.
 #[derive(Resource, Default)]
 pub struct Prefabs {
-    prefabs: TypeIdMap<HashMap<Option<Name>, SpawnFn>>,
+    prefabs: TypeIdMap<HashMap<Option<Name>, PrefabMeta>>,
 }
 
 impl Prefabs {
@@ -359,12 +393,12 @@ impl Prefabs {
         type_id: TypeId,
         variant: impl Borrow<Option<Name>>,
     ) -> Option<Entity> {
-        let spawner = self
+        let meta = self
             .prefabs
             .get(&type_id)
             .and_then(|variants| variants.get(variant.borrow()))?;
 
-        (spawner)(world)
+        meta.spawn(world)
     }
 
     /// Spawn the singleton prefab for a given type.
@@ -415,36 +449,22 @@ impl Prefabs {
         self.prefabs.contains_key(&TypeId::of::<T>())
     }
 
-    pub fn iter(&self) -> impl Iterator {
-        self.prefabs.iter()
-    }
-
-    pub fn iter_type<T>(&self) -> impl Iterator<Item = &Option<Name>>
-    where
-        T: 'static,
-    {
-        self.prefabs
-            .get(&TypeId::of::<T>())
-            .map(|variants| variants.keys())
-            .unwrap_or_default()
-    }
-
-    pub fn iter_variants<T>(&self) -> impl Iterator<Item = &Option<Name>>
-    where
-        T: 'static,
-    {
-        self.prefabs
-            .get(&TypeId::of::<T>())
-            .map(|variants| variants.keys())
-            .unwrap_or_default()
-    }
-
-    pub fn iter_all_types(
+    pub fn iter(
         &self,
-    ) -> impl Iterator<Item = (TypeId, hash_map::Keys<'_, Option<Name>, SpawnFn>)> {
+    ) -> impl Iterator<Item = (TypeId, hash_map::Iter<'_, Option<Name>, PrefabMeta>)> {
         self.prefabs
             .iter()
-            .map(|(id, variants)| (*id, variants.keys()))
+            .map(|(id, variants)| (*id, variants.iter()))
+    }
+
+    pub fn iter_variants_of<T>(&self) -> impl Iterator<Item = &Option<Name>>
+    where
+        T: 'static,
+    {
+        self.prefabs
+            .get(&TypeId::of::<T>())
+            .map(|variants| variants.keys())
+            .unwrap_or_default()
     }
 
     pub fn register_prefab<T: Prefab>(&mut self, handle: Handle<T::Descriptor>, world: &mut World) {
@@ -486,7 +506,7 @@ impl Prefabs {
         let entry = self.prefabs.entry(TypeId::of::<T>()).or_default();
         entry.insert(
             name,
-            Box::new(move |world: &mut World| {
+            PrefabMeta::new(handle.clone().untyped(), move |world: &mut World| {
                 let descriptors = world.resource::<Assets<T::Descriptor>>();
                 let Some(descriptor) = descriptors.get(handle.id()).cloned() else {
                     error!(
@@ -521,7 +541,7 @@ impl Prefabs {
         let entry = self.prefabs.entry(TypeId::of::<T>()).or_default();
         entry.insert(
             name.clone(),
-            Box::new(move |world: &mut World| {
+            PrefabMeta::new_static(move |world: &mut World| {
                 world.resource_scope(|world, mut state: Mut<StaticPrefabStateHolder<T>>| {
                     let entity = world.spawn_empty().id();
                     let params = state.get_mut(world);
@@ -543,12 +563,14 @@ where
     descriptors: Res<'w, Assets<<T as Prefab>::Descriptor>>,
 }
 
+/// Used as a means of keeping the prefab alive
+/// If no longer needed this can be despawned
 #[derive(Resource)]
-pub struct SinglePrefabHandle<T>(Handle<T::Descriptor>)
+pub struct SingletonPrefabHandle<T>(Handle<T::Descriptor>)
 where
     T: Prefab;
 
-impl<T> SinglePrefabHandle<T>
+impl<T> SingletonPrefabHandle<T>
 where
     T: Prefab,
 {

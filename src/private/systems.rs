@@ -4,7 +4,7 @@ use bevy_log::prelude::*;
 
 use crate::{
     Prefab, PrefabFolderHandle, PrefabLoadedEvent, Prefabs, PrefabsLoadFailureEvent,
-    PrefabsLoadedEvent, SinglePrefabHandle,
+    PrefabsLoadedEvent, SingletonPrefabHandle,
     private::{
         FolderLoadCheck,
         util::{PrefabRegistrationResult, get_variant_name},
@@ -20,7 +20,7 @@ where
         commands.insert_resource(PrefabFolderHandle::<T>::new(handle));
     } else {
         let handle = assets.load(T::path().into());
-        commands.insert_resource(SinglePrefabHandle::<T>(handle));
+        commands.insert_resource(SingletonPrefabHandle::<T>(handle));
     }
 }
 
