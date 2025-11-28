@@ -161,7 +161,7 @@ fn on_folder_failure(_: On<brefabs::PrefabsLoadFailureEvent<ExamplePrefab>>) {
 }
 
 fn spawn_cubes(world: &mut World, mut index: Local<usize>) {
-    world.resource_scope(|world, mut prefabs: Mut<Prefabs>| {
+    world.resource_scope(|world, prefabs: Mut<Prefabs>| {
         *index = (*index + 1) % prefabs.len_of_type::<ExamplePrefab>();
         let Some(name) = prefabs
             .iter_variants::<ExamplePrefab>()

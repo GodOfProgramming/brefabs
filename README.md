@@ -12,4 +12,6 @@ See the [simple](examples/simple.rs) example for basic usage.
 
 |  Bevy    |  Brefabs  |
 | -------- | --------- |
+|  0.17.3  |  0.3.*    |
+|  0.17.3  |  0.2.*    |
 |  0.17.3  |  0.1.*    |

@@ -12,7 +12,7 @@
 //! use [`Commands::queue`] with [`World::resource_scope`] to pull [`Prefabs`] from the world.
 //!
 //! See [`SpawnPrefabEvent`] for an example of this. This type can also be used if you do not care that an event is used
-//! to spawn the prefab.
+//! to spawn the prefab along with its untyped counterpart.
 
 mod private;
 
@@ -49,8 +49,8 @@ pub struct PrefabPlugin {
     /// In the event a type is registered twice, panic
     panic_on_double_registration: bool,
 
-    /// Add an observer that you can trigger with
-    use_spawner_convenience_observer: bool,
+    /// Add observers that you can trigger with [`SpawnPrefabEvent`] and [`SpawnUntypedPrefabEvent`]
+    use_spawner_events: bool,
 
     registrations: OrderMap<TypeId, RegistrationFn>,
 }
@@ -59,7 +59,7 @@ impl Default for PrefabPlugin {
     fn default() -> Self {
         Self {
             panic_on_double_registration: true,
-            use_spawner_convenience_observer: true,
+            use_spawner_events: true,
             registrations: Default::default(),
         }
     }
@@ -76,17 +76,17 @@ impl PrefabPlugin {
         self
     }
 
-    pub fn with_spawner_convenience_observer(mut self, value: bool) -> Self {
-        self.set_spawner_convenience_observer(value);
+    pub fn with_spawner_events(mut self, value: bool) -> Self {
+        self.set_use_spawner_events(value);
         self
     }
 
-    pub fn set_spawner_convenience_observer(&mut self, value: bool) -> &mut Self {
-        self.use_spawner_convenience_observer = value;
+    pub fn set_use_spawner_events(&mut self, value: bool) -> &mut Self {
+        self.use_spawner_events = value;
         self
     }
 
-    /// Register a prefab type using the nameless slot
+    /// Register a prefab type using the singleton slot
     pub fn with_prefab<T>(mut self) -> Self
     where
         T: Prefab,
@@ -95,7 +95,7 @@ impl PrefabPlugin {
         self
     }
 
-    /// Register a prefab type using the nameless slot
+    /// Register a prefab type using the singleton slot
     pub fn add_prefab<T>(&mut self) -> &mut Self
     where
         T: Prefab,
@@ -124,7 +124,7 @@ impl PrefabPlugin {
         self
     }
 
-    /// Register a static prefab type using the nameless slot
+    /// Register a static prefab type using the singleton slot
     pub fn with_static_prefab<T>(mut self) -> Self
     where
         T: StaticPrefab,
@@ -133,7 +133,7 @@ impl PrefabPlugin {
         self
     }
 
-    /// Register a static prefab type using the nameless slot
+    /// Register a static prefab type using the singleton slot
     pub fn add_static_prefab<T>(&mut self) -> &mut Self
     where
         T: StaticPrefab,
@@ -204,7 +204,7 @@ impl PrefabPlugin {
     where
         T: Send + Sync + 'static,
     {
-        if self.use_spawner_convenience_observer {
+        if self.use_spawner_events {
             app.add_observer(SpawnPrefabEvent::<T>::handle);
         }
     }
@@ -213,6 +213,10 @@ impl PrefabPlugin {
 impl Plugin for PrefabPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Prefabs>();
+
+        if self.use_spawner_events {
+            app.add_observer(SpawnUntypedPrefabEvent::handle);
+        }
 
         for f in self.registrations.values() {
             (f)(self, app);
@@ -335,11 +339,21 @@ pub struct Prefabs {
 
 impl Prefabs {
     /// Spawn a prefab with the supplied identifier.
-    pub fn spawn<T: 'static>(&mut self, world: &mut World, key: impl Borrow<Option<Name>>) -> bool {
+    pub fn spawn<T: 'static>(&self, world: &mut World, variant: impl Borrow<Option<Name>>) -> bool {
+        self.spawn_untyped(world, TypeId::of::<T>(), variant)
+    }
+
+    /// Spawn the type specified by the [`TypeId`] and its optional name
+    pub fn spawn_untyped(
+        &self,
+        world: &mut World,
+        type_id: TypeId,
+        variant: impl Borrow<Option<Name>>,
+    ) -> bool {
         let Some(spawner) = self
             .prefabs
-            .get_mut(&TypeId::of::<T>())
-            .and_then(|variants| variants.get_mut(key.borrow()))
+            .get(&type_id)
+            .and_then(|variants| variants.get(variant.borrow()))
         else {
             return false;
         };
@@ -349,10 +363,10 @@ impl Prefabs {
         true
     }
 
-    /// Spawn the nameless prefab for a given type.
+    /// Spawn the singleton prefab for a given type.
     ///
     /// Returns true if successful.
-    pub fn spawn_nameless<T>(&mut self, world: &mut World) -> bool
+    pub fn spawn_singleton<T>(&self, world: &mut World) -> bool
     where
         T: 'static,
     {
@@ -362,7 +376,7 @@ impl Prefabs {
     /// Spawn the variant of a prefab for a given type.
     ///
     /// Returns true if successful.
-    pub fn spawn_variant<T>(&mut self, world: &mut World, name: impl Into<Name>) -> bool
+    pub fn spawn_variant<T>(&self, world: &mut World, name: impl Into<Name>) -> bool
     where
         T: 'static,
     {
@@ -379,7 +393,7 @@ impl Prefabs {
         self.prefabs.is_empty()
     }
 
-    /// Return the number of prefab variants registered for a type. This includes the nameless if present.
+    /// Return the number of prefab variants registered for a type. This includes the singleton if present.
     pub fn len_of_type<T>(&self) -> usize
     where
         T: 'static,
@@ -625,6 +639,57 @@ where
     }
 }
 
+/// An event used to spawn a prefab referenced by TypeId
+#[derive(Event)]
+pub struct SpawnUntypedPrefabEvent {
+    type_id: TypeId,
+    variant: Option<Name>,
+}
+
+impl SpawnUntypedPrefabEvent {
+    pub fn new(type_id: TypeId, variant: impl Into<Option<Name>>) -> Self {
+        Self {
+            type_id,
+            variant: variant.into(),
+        }
+    }
+
+    fn handle(event: On<Self>, mut commands: Commands) {
+        let type_id = event.type_id;
+        let variant = event.variant.clone();
+        commands.queue(move |world: &mut World| {
+            world.resource_scope(|world, prefabs: Mut<Prefabs>| {
+                if !prefabs.spawn_untyped(world, type_id, &variant) {
+                    world.trigger(UntypedPrefabSpawnFailureEvent::new(type_id, variant));
+                }
+            });
+        });
+    }
+}
+
+#[derive(Event)]
+pub struct UntypedPrefabSpawnFailureEvent {
+    type_id: TypeId,
+    variant: Option<Name>,
+}
+
+impl UntypedPrefabSpawnFailureEvent {
+    pub fn new(type_id: TypeId, variant: impl Into<Option<Name>>) -> Self {
+        Self {
+            type_id,
+            variant: variant.into(),
+        }
+    }
+
+    pub fn type_id(&self) -> TypeId {
+        self.type_id
+    }
+
+    pub fn variant(&self) -> Option<&Name> {
+        self.variant.as_ref()
+    }
+}
+
 #[derive(Event)]
 pub struct SpawnPrefabEvent<T> {
     variant: Option<Name>,
@@ -645,7 +710,7 @@ where
     fn handle(event: On<Self>, mut commands: Commands) {
         let variant = event.variant.clone();
         commands.queue(move |world: &mut World| {
-            world.resource_scope(|world, mut prefabs: Mut<Prefabs>| {
+            world.resource_scope(|world, prefabs: Mut<Prefabs>| {
                 if !prefabs.spawn::<T>(world, &variant) {
                     world.trigger(PrefabSpawnFailureEvent::<T>::new(variant));
                 }
