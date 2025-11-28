@@ -22,6 +22,7 @@ use crate::private::{
         handle_descriptor_loads, handle_folder_loads, on_prefab_loaded, register_prefab,
         should_check_folder_loads, startup,
     },
+    util::try_apply_bundle,
 };
 use bevy_app::prelude::*;
 use bevy_asset::{LoadedFolder, prelude::*};
@@ -320,7 +321,7 @@ where
     }
 }
 
-type SpawnFn = Box<dyn Fn(&mut World) + Send + Sync>;
+type SpawnFn = Box<dyn (Fn(&mut World) -> Option<Entity>) + Send + Sync>;
 
 #[derive(Resource, Deref, DerefMut)]
 struct StateHolder<T>(SystemState<T>)
@@ -339,34 +340,37 @@ pub struct Prefabs {
 
 impl Prefabs {
     /// Spawn a prefab with the supplied identifier.
-    pub fn spawn<T: 'static>(&self, world: &mut World, variant: impl Borrow<Option<Name>>) -> bool {
+    ///
+    /// Returns the entity if it was successfully spawned
+    pub fn spawn<T: 'static>(
+        &self,
+        world: &mut World,
+        variant: impl Borrow<Option<Name>>,
+    ) -> Option<Entity> {
         self.spawn_untyped(world, TypeId::of::<T>(), variant)
     }
 
     /// Spawn the type specified by the [`TypeId`] and its optional name
+    ///
+    /// Returns the entity if it was successfully spawned
     pub fn spawn_untyped(
         &self,
         world: &mut World,
         type_id: TypeId,
         variant: impl Borrow<Option<Name>>,
-    ) -> bool {
-        let Some(spawner) = self
+    ) -> Option<Entity> {
+        let spawner = self
             .prefabs
             .get(&type_id)
-            .and_then(|variants| variants.get(variant.borrow()))
-        else {
-            return false;
-        };
+            .and_then(|variants| variants.get(variant.borrow()))?;
 
-        (spawner)(world);
-
-        true
+        (spawner)(world)
     }
 
     /// Spawn the singleton prefab for a given type.
     ///
-    /// Returns true if successful.
-    pub fn spawn_singleton<T>(&self, world: &mut World) -> bool
+    /// Returns the entity if it was successfully spawned
+    pub fn spawn_singleton<T>(&self, world: &mut World) -> Option<Entity>
     where
         T: 'static,
     {
@@ -375,8 +379,8 @@ impl Prefabs {
 
     /// Spawn the variant of a prefab for a given type.
     ///
-    /// Returns true if successful.
-    pub fn spawn_variant<T>(&self, world: &mut World, name: impl Into<Name>) -> bool
+    /// Returns the entity if it was successfully spawned
+    pub fn spawn_variant<T>(&self, world: &mut World, name: impl Into<Name>) -> Option<Entity>
     where
         T: 'static,
     {
@@ -489,20 +493,17 @@ impl Prefabs {
                         "Failed to get descriptor asset for {}",
                         std::any::type_name::<T>()
                     );
-                    return;
+                    return None;
                 };
 
-                let entity = world.spawn_empty().id();
-
                 world.resource_scope(|world, mut state: Mut<PrefabStateHolder<T>>| {
+                    let entity = world.spawn_empty().id();
                     let params = state.get_mut(world);
                     let bundle = T::spawn(entity, descriptor, params);
                     state.apply(world);
 
-                    if let Ok(mut entity) = world.get_entity_mut(entity) {
-                        entity.insert(bundle);
-                    }
-                });
+                    try_apply_bundle(world, entity, bundle)
+                })
             }),
         );
     }
@@ -521,15 +522,14 @@ impl Prefabs {
         entry.insert(
             name.clone(),
             Box::new(move |world: &mut World| {
-                let entity = world.spawn_empty().id();
-
                 world.resource_scope(|world, mut state: Mut<StaticPrefabStateHolder<T>>| {
+                    let entity = world.spawn_empty().id();
                     let params = state.get_mut(world);
                     let bundle = T::spawn(entity, name.clone(), params);
-                    if let Ok(mut entity) = world.get_entity_mut(entity) {
-                        entity.insert(bundle);
-                    }
-                });
+                    state.apply(world);
+
+                    try_apply_bundle(world, entity, bundle)
+                })
             }),
         );
     }
@@ -659,7 +659,7 @@ impl SpawnUntypedPrefabEvent {
         let variant = event.variant.clone();
         commands.queue(move |world: &mut World| {
             world.resource_scope(|world, prefabs: Mut<Prefabs>| {
-                if !prefabs.spawn_untyped(world, type_id, &variant) {
+                if prefabs.spawn_untyped(world, type_id, &variant).is_none() {
                     world.trigger(UntypedPrefabSpawnFailureEvent::new(type_id, variant));
                 }
             });
@@ -711,7 +711,7 @@ where
         let variant = event.variant.clone();
         commands.queue(move |world: &mut World| {
             world.resource_scope(|world, prefabs: Mut<Prefabs>| {
-                if !prefabs.spawn::<T>(world, &variant) {
+                if prefabs.spawn::<T>(world, &variant).is_none() {
                     world.trigger(PrefabSpawnFailureEvent::<T>::new(variant));
                 }
             });

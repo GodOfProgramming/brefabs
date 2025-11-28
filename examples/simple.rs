@@ -171,7 +171,7 @@ fn spawn_cubes(world: &mut World, mut index: Local<usize>) {
             return;
         };
 
-        if !prefabs.spawn::<ExamplePrefab>(world, name) {
+        if prefabs.spawn::<ExamplePrefab>(world, name).is_none() {
             error!("failed to spawn variant")
         }
     });

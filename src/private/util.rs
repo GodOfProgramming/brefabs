@@ -79,3 +79,12 @@ fn get_field_key_from_tuple_struct(
 
     Some(reflected.field(key)).flatten()
 }
+
+pub fn try_apply_bundle(world: &mut World, entity: Entity, bundle: impl Bundle) -> Option<Entity> {
+    if let Ok(mut entity_ref) = world.get_entity_mut(entity) {
+        entity_ref.insert(bundle);
+        Some(entity)
+    } else {
+        None
+    }
+}
