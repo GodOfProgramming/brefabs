@@ -32,12 +32,17 @@ use bevy_ecs::{
 };
 use bevy_log::prelude::*;
 use bevy_platform::collections::{HashMap, hash_map};
-use bevy_reflect::Reflectable;
+use bevy_reflect::{Reflect, Reflectable};
 use bevy_utils::TypeIdMap;
 use derive_more::{Deref, DerefMut};
 use ordermap::OrderMap;
 use serde::Deserialize;
-use std::{any::TypeId, borrow::Borrow, marker::PhantomData, path::PathBuf};
+use std::{
+    any::TypeId,
+    borrow::{Borrow, BorrowMut},
+    marker::PhantomData,
+    path::PathBuf,
+};
 
 /// A SystemParam QOL type to indicate no params are desired
 #[derive(SystemParam)]
@@ -322,6 +327,7 @@ where
 }
 
 type SpawnFn = Box<dyn (Fn(&mut World) -> Option<Entity>) + Send + Sync + 'static>;
+type DescriptorFn = Box<dyn (Fn(&mut World) -> Option<Box<dyn Reflect>>) + Send + Sync + 'static>;
 
 #[derive(Resource, Deref, DerefMut)]
 struct StateHolder<T>(SystemState<T>)
@@ -333,17 +339,47 @@ type StaticPrefabStateHolder<'w, 's, T> = StateHolder<<T as StaticPrefab>::Param
 
 pub struct PrefabMeta {
     handle: Option<UntypedHandle>,
-    spawn_fn: SpawnFn,
+    spawn_info: SpawnInfo,
+}
+
+pub enum SpawnInfo {
+    Prefab {
+        spawn_fn: SpawnFn,
+        descriptor_fn: DescriptorFn,
+    },
+    StaticPrefab {
+        spawn_fn: SpawnFn,
+    },
+}
+
+impl SpawnInfo {
+    pub fn spawn(&self, world: &mut World) -> Option<Entity> {
+        match self {
+            SpawnInfo::Prefab { spawn_fn, .. } => (spawn_fn)(world),
+            SpawnInfo::StaticPrefab { spawn_fn } => (spawn_fn)(world),
+        }
+    }
+
+    pub fn try_spawn_descriptor(&self, world: &mut World) -> Option<Box<dyn Reflect>> {
+        match self {
+            SpawnInfo::Prefab { descriptor_fn, .. } => (descriptor_fn)(world),
+            SpawnInfo::StaticPrefab { .. } => None,
+        }
+    }
 }
 
 impl PrefabMeta {
     fn new(
         handle: UntypedHandle,
         spawn_fn: impl (Fn(&mut World) -> Option<Entity>) + Send + Sync + 'static,
+        descriptor_fn: impl (Fn(&mut World) -> Option<Box<dyn Reflect>>) + Send + Sync + 'static,
     ) -> Self {
         Self {
             handle: Some(handle),
-            spawn_fn: Box::new(spawn_fn),
+            spawn_info: SpawnInfo::Prefab {
+                spawn_fn: Box::new(spawn_fn),
+                descriptor_fn: Box::new(descriptor_fn),
+            },
         }
     }
 
@@ -352,7 +388,9 @@ impl PrefabMeta {
     ) -> Self {
         Self {
             handle: None,
-            spawn_fn: Box::new(spawn_fn),
+            spawn_info: SpawnInfo::StaticPrefab {
+                spawn_fn: Box::new(spawn_fn),
+            },
         }
     }
 
@@ -361,7 +399,7 @@ impl PrefabMeta {
     }
 
     fn spawn(&self, world: &mut World) -> Option<Entity> {
-        (self.spawn_fn)(world)
+        self.spawn_info.spawn(world)
     }
 }
 
@@ -442,6 +480,7 @@ impl Prefabs {
             .unwrap_or_default()
     }
 
+    /// Check if the type has at least one registered prefab
     pub fn has_type<T>(&self) -> bool
     where
         T: 'static,
@@ -449,6 +488,7 @@ impl Prefabs {
         self.prefabs.contains_key(&TypeId::of::<T>())
     }
 
+    /// Iterate all prefabs and their variants
     pub fn iter(
         &self,
     ) -> impl Iterator<Item = (TypeId, hash_map::Iter<'_, Option<Name>, PrefabMeta>)> {
@@ -457,20 +497,35 @@ impl Prefabs {
             .map(|(id, variants)| (*id, variants.iter()))
     }
 
+    /// Iterate variants of a specific prefab
     pub fn iter_variants_of<T>(&self) -> impl Iterator<Item = &Option<Name>>
     where
         T: 'static,
     {
+        self.iter_variants_of_untyped(TypeId::of::<T>())
+    }
+
+    /// Iterate variants of a specific prefab
+    pub fn iter_variants_of_untyped(&self, type_id: TypeId) -> impl Iterator<Item = &Option<Name>> {
         self.prefabs
-            .get(&TypeId::of::<T>())
+            .get(&type_id)
             .map(|variants| variants.keys())
             .unwrap_or_default()
     }
 
+    /// Get the meta of a variant
+    pub fn meta(&self, type_id: TypeId, variant: impl Borrow<Option<Name>>) -> Option<&PrefabMeta> {
+        self.prefabs
+            .get(&type_id)
+            .and_then(|variants| variants.get(variant.borrow()))
+    }
+
+    /// Manually register a prefab using the supplied handle to the descriptor
     pub fn register_prefab<T: Prefab>(&mut self, handle: Handle<T::Descriptor>, world: &mut World) {
         self.internal_register_prefab::<T>(handle, world, None);
     }
 
+    /// Manually register a prefab variant using the supplied handle to the descriptor
     pub fn register_prefab_variant<T: Prefab>(
         &mut self,
         handle: Handle<T::Descriptor>,
@@ -480,10 +535,12 @@ impl Prefabs {
         self.internal_register_prefab::<T>(handle, world, Some(name.into()));
     }
 
+    /// Manually register a static prefab
     pub fn register_static_prefab<T: StaticPrefab>(&mut self, world: &mut World) {
         self.internal_register_static_prefab::<T>(world, None);
     }
 
+    /// Manually register a static prefab variant
     pub fn register_static_prefab_variant<T: StaticPrefab>(
         &mut self,
         world: &mut World,
@@ -504,27 +561,46 @@ impl Prefabs {
         }
 
         let entry = self.prefabs.entry(TypeId::of::<T>()).or_default();
+        let untyped_handle = handle.clone().untyped();
+        let spawn_handle = handle.clone();
+        let desc_handle = handle;
+
         entry.insert(
             name,
-            PrefabMeta::new(handle.clone().untyped(), move |world: &mut World| {
-                let descriptors = world.resource::<Assets<T::Descriptor>>();
-                let Some(descriptor) = descriptors.get(handle.id()).cloned() else {
-                    error!(
-                        "Failed to get descriptor asset for {}",
-                        std::any::type_name::<T>()
-                    );
-                    return None;
-                };
+            PrefabMeta::new(
+                untyped_handle,
+                move |world: &mut World| {
+                    let descriptors = world.resource::<Assets<T::Descriptor>>();
+                    let Some(descriptor) = descriptors.get(spawn_handle.id()).cloned() else {
+                        error!(
+                            "Failed to get descriptor asset for {}",
+                            std::any::type_name::<T>()
+                        );
+                        return None;
+                    };
 
-                world.resource_scope(|world, mut state: Mut<PrefabStateHolder<T>>| {
-                    let entity = world.spawn_empty().id();
-                    let params = state.get_mut(world);
-                    let bundle = T::spawn(entity, descriptor, params);
-                    state.apply(world);
+                    world.resource_scope(|world, mut state: Mut<PrefabStateHolder<T>>| {
+                        let entity = world.spawn_empty().id();
+                        let params = state.get_mut(world);
+                        let bundle = T::spawn(entity, descriptor, params);
+                        state.apply(world);
 
-                    try_apply_bundle(world, entity, bundle)
-                })
-            }),
+                        try_apply_bundle(world, entity, bundle)
+                    })
+                },
+                move |world| {
+                    let descriptors = world.resource::<Assets<T::Descriptor>>();
+                    let Some(descriptor) = descriptors.get(desc_handle.id()).cloned() else {
+                        error!(
+                            "Failed to get descriptor asset for {}",
+                            std::any::type_name::<T>()
+                        );
+                        return None;
+                    };
+
+                    Some(Box::new(descriptor))
+                },
+            ),
         );
     }
 
@@ -553,14 +629,6 @@ impl Prefabs {
             }),
         );
     }
-}
-
-#[derive(SystemParam, Deref)]
-pub struct PrefabDescriptors<'w, T>
-where
-    T: Prefab,
-{
-    descriptors: Res<'w, Assets<<T as Prefab>::Descriptor>>,
 }
 
 /// Used as a means of keeping the prefab alive
@@ -759,3 +827,37 @@ impl<T> PrefabSpawnFailureEvent<T> {
         self.variant.as_ref()
     }
 }
+
+pub trait WorldExtensions: BorrowMut<World> {
+    fn spawn_prefab<T>(&mut self, variant: Option<Name>) -> Option<Entity>
+    where
+        T: Prefab,
+    {
+        self.borrow_mut()
+            .resource_scope(|world, prefabs: Mut<Prefabs>| prefabs.spawn::<T>(world, variant))
+    }
+
+    fn spawn_untyped_prefab(&mut self, type_id: TypeId, variant: Option<Name>) -> Option<Entity> {
+        self.borrow_mut()
+            .resource_scope(|world, prefabs: Mut<Prefabs>| {
+                prefabs.spawn_untyped(world, type_id, variant)
+            })
+    }
+
+    fn spawn_prefab_descriptor(
+        &mut self,
+        type_id: TypeId,
+        variant: Option<Name>,
+    ) -> Option<Box<dyn Reflect>> {
+        self.borrow_mut()
+            .resource_scope(|world, prefabs: Mut<Prefabs>| {
+                prefabs
+                    .meta(type_id, variant)
+                    .and_then(|meta| meta.spawn_info.try_spawn_descriptor(world))
+            })
+    }
+}
+
+impl WorldExtensions for World {}
+
+impl WorldExtensions for &mut World {}
