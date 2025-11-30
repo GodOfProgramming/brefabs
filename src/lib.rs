@@ -326,7 +326,7 @@ where
     }
 }
 
-type SpawnFn = Box<dyn (Fn(&mut World) -> Option<Entity>) + Send + Sync + 'static>;
+type SpawnFn = Box<dyn (Fn(&mut World, Entity) -> Option<Entity>) + Send + Sync + 'static>;
 type DescriptorFn = Box<dyn (Fn(&mut World) -> Option<Box<dyn Reflect>>) + Send + Sync + 'static>;
 
 #[derive(Resource, Deref, DerefMut)]
@@ -354,9 +354,14 @@ pub enum SpawnInfo {
 
 impl SpawnInfo {
     pub fn spawn(&self, world: &mut World) -> Option<Entity> {
+        let entity = world.spawn_empty().id();
+        self.apply_to(world, entity)
+    }
+
+    pub fn apply_to(&self, world: &mut World, entity: Entity) -> Option<Entity> {
         match self {
-            SpawnInfo::Prefab { spawn_fn, .. } => (spawn_fn)(world),
-            SpawnInfo::StaticPrefab { spawn_fn } => (spawn_fn)(world),
+            SpawnInfo::Prefab { spawn_fn, .. } => (spawn_fn)(world, entity),
+            SpawnInfo::StaticPrefab { spawn_fn } => (spawn_fn)(world, entity),
         }
     }
 
@@ -371,7 +376,7 @@ impl SpawnInfo {
 impl PrefabMeta {
     fn new(
         handle: UntypedHandle,
-        spawn_fn: impl (Fn(&mut World) -> Option<Entity>) + Send + Sync + 'static,
+        spawn_fn: impl (Fn(&mut World, Entity) -> Option<Entity>) + Send + Sync + 'static,
         descriptor_fn: impl (Fn(&mut World) -> Option<Box<dyn Reflect>>) + Send + Sync + 'static,
     ) -> Self {
         Self {
@@ -384,7 +389,7 @@ impl PrefabMeta {
     }
 
     fn new_static(
-        spawn_fn: impl (Fn(&mut World) -> Option<Entity>) + Send + Sync + 'static,
+        spawn_fn: impl (Fn(&mut World, Entity) -> Option<Entity>) + Send + Sync + 'static,
     ) -> Self {
         Self {
             handle: None,
@@ -400,6 +405,10 @@ impl PrefabMeta {
 
     fn spawn(&self, world: &mut World) -> Option<Entity> {
         self.spawn_info.spawn(world)
+    }
+
+    fn apply_to(&self, world: &mut World, entity: Entity) -> Option<Entity> {
+        self.spawn_info.apply_to(world, entity)
     }
 }
 
@@ -431,12 +440,7 @@ impl Prefabs {
         type_id: TypeId,
         variant: impl Borrow<Option<Name>>,
     ) -> Option<Entity> {
-        let meta = self
-            .prefabs
-            .get(&type_id)
-            .and_then(|variants| variants.get(variant.borrow()))?;
-
-        meta.spawn(world)
+        self.meta(type_id, variant)?.spawn(world)
     }
 
     /// Spawn the singleton prefab for a given type.
@@ -457,6 +461,56 @@ impl Prefabs {
         T: 'static,
     {
         self.spawn::<T>(world, Some(name.into()))
+    }
+
+    /// Apply this prefab on an existing entity
+    ///
+    /// Returns the entity if it was successfully applied
+    pub fn apply_to<T: 'static>(
+        &self,
+        world: &mut World,
+        variant: impl Borrow<Option<Name>>,
+        entity: Entity,
+    ) -> Option<Entity> {
+        self.apply_untyped_to(world, TypeId::of::<T>(), variant, entity)
+    }
+
+    /// Apply this prefab on an existing entity
+    ///
+    /// Returns the entity if it was successfully applied
+    pub fn apply_untyped_to(
+        &self,
+        world: &mut World,
+        type_id: TypeId,
+        variant: impl Borrow<Option<Name>>,
+        entity: Entity,
+    ) -> Option<Entity> {
+        self.meta(type_id, variant)?.apply_to(world, entity)
+    }
+
+    /// Apply this prefab on an existing entity
+    ///
+    /// Returns the entity if it was successfully applied
+    pub fn apply_singleton_to<T>(&self, world: &mut World, entity: Entity) -> Option<Entity>
+    where
+        T: 'static,
+    {
+        self.apply_to::<T>(world, None, entity)
+    }
+
+    /// Apply this prefab on an existing entity
+    ///
+    /// Returns the entity if it was successfully applied
+    pub fn apply_variant_to<T>(
+        &self,
+        world: &mut World,
+        name: impl Into<Name>,
+        entity: Entity,
+    ) -> Option<Entity>
+    where
+        T: 'static,
+    {
+        self.apply_to::<T>(world, Some(name.into()), entity)
     }
 
     /// Return the number of prefabs registered.
@@ -569,7 +623,7 @@ impl Prefabs {
             name,
             PrefabMeta::new(
                 untyped_handle,
-                move |world: &mut World| {
+                move |world: &mut World, entity: Entity| {
                     let descriptors = world.resource::<Assets<T::Descriptor>>();
                     let Some(descriptor) = descriptors.get(spawn_handle.id()).cloned() else {
                         error!(
@@ -580,7 +634,6 @@ impl Prefabs {
                     };
 
                     world.resource_scope(|world, mut state: Mut<PrefabStateHolder<T>>| {
-                        let entity = world.spawn_empty().id();
                         let params = state.get_mut(world);
                         let bundle = T::spawn(entity, descriptor, params);
                         state.apply(world);
@@ -617,9 +670,8 @@ impl Prefabs {
         let entry = self.prefabs.entry(TypeId::of::<T>()).or_default();
         entry.insert(
             name.clone(),
-            PrefabMeta::new_static(move |world: &mut World| {
+            PrefabMeta::new_static(move |world: &mut World, entity: Entity| {
                 world.resource_scope(|world, mut state: Mut<StaticPrefabStateHolder<T>>| {
-                    let entity = world.spawn_empty().id();
                     let params = state.get_mut(world);
                     let bundle = T::spawn(entity, name.clone(), params);
                     state.apply(world);
